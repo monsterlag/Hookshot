@@ -2,7 +2,7 @@ name: Game-free source regressions
 
 on:
   push:
-    branches: [main]
+    branches: [main, test/cpp-preflight-smoke]
     paths:
       - nx2/nup.py
       - nx2/make_game.py
