@@ -37,10 +37,11 @@ def module_bytes(supported=True, payload=b"new authored module"):
 class NupCacheTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="hookshot-cache-test-")
+        self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
-        self.addCleanup(self.cleanup)
         self.out = self.root / "output"
         self.work = self.root / "work"
+        self.addCleanup(self.assert_owned_fixture)
         self.out.mkdir()
         self.work.mkdir()
         self.old_nup = self.root / "old.nup"
@@ -57,13 +58,13 @@ class NupCacheTests(unittest.TestCase):
         save.mkdir(parents=True)
         (save / "sentinel.txt").write_bytes(b"authored save sentinel")
         self.extractions = []
+        self.output = ""
 
-    def cleanup(self):
+    def assert_owned_fixture(self):
         # The builder only receives descendants of this test-owned temporary directory.
         self.assertEqual(self.root.parent, Path(tempfile.gettempdir()).resolve())
         self.assertTrue(self.out.resolve().is_relative_to(self.root))
         self.assertTrue(self.work.resolve().is_relative_to(self.root))
-        self.temporary.cleanup()
 
     def stamp(self, nup):
         return "unpacked by this builder: %s %d" % (nup.name, nup.stat().st_size)
@@ -95,13 +96,26 @@ class NupCacheTests(unittest.TestCase):
         # The only external operation exercised is authored extraction above; no compiler, SDK,
         # translation, power-state update or real game is involved.
         with contextlib.ExitStack() as stack:
+            blocked = [
+                stack.enter_context(mock.patch.object(make_game.subprocess, "Popen",
+                                                     side_effect=AssertionError("Unexpected process launch"))),
+                stack.enter_context(mock.patch.object(os, "system",
+                                                     side_effect=AssertionError("Unexpected shell command"))),
+                stack.enter_context(mock.patch.object(os, "startfile", create=True,
+                                                     side_effect=AssertionError("Unexpected file launch"))),
+            ]
             stack.enter_context(mock.patch.object(sys, "argv", argv))
             stack.enter_context(mock.patch.object(make_game, "check_windows_sdk"))
             stack.enter_context(mock.patch.object(make_game, "no_throttle"))
             stack.enter_context(mock.patch("ctypes.WinDLL", create=True))
             stack.enter_context(mock.patch.object(make_game, "run", side_effect=run))
-            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
-            make_game.main()
+            output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            try:
+                make_game.main()
+            finally:
+                self.output = output.getvalue()
+                for launch in blocked:
+                    launch.assert_not_called()
 
     def test_changed_source_replaces_romfs_and_exefs_together(self):
         with self.assertRaises(Prepared):
@@ -126,20 +140,25 @@ class NupCacheTests(unittest.TestCase):
         before = self.cache()
         with self.assertRaises(ExtractionFailed):
             self.run_to_lift(self.new_nup, failure=ExtractionFailed())
+        self.assertEqual(self.extractions, [self.new_nup])
         self.assertEqual(self.cache(), before)
 
     def test_unsupported_build_preserves_the_previous_cache_and_save(self):
         before = self.cache()
         with self.assertRaises(SystemExit) as result:
             self.run_to_lift(self.new_nup, supported=False)
+        self.assertEqual(self.extractions, [self.new_nup])
         self.assertEqual(result.exception.code, 1)
+        self.assertIn("This is build 01234567. Hookshot supports build %s." % make_game.BUILD_ID, self.output)
         self.assertEqual(self.cache(), before)
 
     def test_missing_romfs_preserves_the_previous_cache_and_save(self):
         before = self.cache()
         with self.assertRaises(SystemExit) as result:
             self.run_to_lift(self.new_nup, include_romfs=False)
+        self.assertEqual(self.extractions, [self.new_nup])
         self.assertEqual(result.exception.code, 1)
+        self.assertIn("The package did not contain a romfs folder.", self.output)
         self.assertEqual(self.cache(), before)
 
     def test_reparse_cache_is_rejected_before_extraction_or_replacement(self):
