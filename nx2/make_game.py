@@ -17,6 +17,7 @@ import argparse
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -95,6 +96,28 @@ def check_modules(exefs):
             if head[:4] != b"NSO0":
                 fail("The file %s in this dump is not a game module (it starts %s). Try another dump of the game, or send this message to the "
                      "Hookshot developers." % (name, head.hex()))
+
+
+def check_supported_build(exefs):
+    bid = build_id(os.path.join(exefs, "main"))
+    if not bid.startswith(BUILD_ID):
+        fail("This is build %s. Hookshot supports build %s." % (bid[:8], BUILD_ID))
+
+
+def check_cache_paths(out, paths):
+    """Resolve generated paths and reject symbolic links/reparse points before replacement."""
+    root = os.path.realpath(out)
+    for path in paths:
+        try:
+            inside = os.path.commonpath((root, os.path.realpath(path))) == root
+        except ValueError:
+            inside = False
+        attrs = os.lstat(path) if os.path.lexists(path) else None
+        linked = os.path.islink(path) or bool(
+            getattr(attrs, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+        if not inside or linked:
+            fail("The generated cache path %s is not a normal path inside the build folder (symbolic links and reparse points are not supported). "
+                 "Choose a different output folder." % path)
 
 
 def check(a, work):
@@ -282,6 +305,7 @@ def main():
         game = os.path.join(out, ".game")
         good = os.path.join(out, ".hookshot_romfs")
         kept = os.path.join(out, ".hookshot_exefs")
+        check_cache_paths(out, (game, good, kept, romfs))
         # (an update of the builder over the same .nup: nothing to read again, only what the build needs. Issues 21 and 28)
         st = os.stat(a.nup)
         stamp = "unpacked by this builder: %s %d" % (os.path.basename(a.nup), st.st_size)
@@ -294,14 +318,19 @@ def main():
             shutil.copytree(kept, exefs)
         else:
             shutil.rmtree(game, ignore_errors=True)
-            shutil.rmtree(kept, ignore_errors=True)
-            if not os.path.exists(good):
-                shutil.rmtree(romfs, ignore_errors=True)
             run(PY + ["nx2/nup.py", a.nup, "--extract", game])
-            shutil.move(os.path.join(game, "exefs"), exefs)
-            if not os.path.isdir(romfs):
-                shutil.move(os.path.join(game, "romfs"), romfs)
+            # Keep the last usable cache until the new package has been read and validated.
+            staged_exefs = os.path.join(game, "exefs")
+            check_modules(staged_exefs)
+            check_supported_build(staged_exefs)
+            if not os.path.isdir(os.path.join(game, "romfs")):
+                fail("The package did not contain a romfs folder.")
+            if os.path.exists(romfs):
+                shutil.rmtree(romfs)
+            shutil.move(os.path.join(game, "romfs"), romfs)
+            shutil.move(staged_exefs, exefs)
             shutil.rmtree(game, ignore_errors=True)
+            shutil.rmtree(kept, ignore_errors=True)
             shutil.copytree(exefs, kept)
             with open(good, "w") as f:
                 f.write(stamp + chr(10))
@@ -310,9 +339,7 @@ def main():
         shutil.copytree(a.exefs, exefs)   # (unpacked in place: the user's copy stays as it is)
         run(PY + ["nx2/unpack.py", exefs])
         link_or_copy(a.romfs, romfs)
-    bid = build_id(os.path.join(exefs, "main"))
-    if not bid.startswith(BUILD_ID):
-        fail("This is build %s. Hookshot supports build %s." % (bid[:8], BUILD_ID))
+    check_supported_build(exefs)
 
     # (made once on the development PC: lists of addresses and counts, no game code)
     for name in ("hot_funcs.txt", "hot_order.txt", "hookshot_pieces.prof", "hookshot.res"):
