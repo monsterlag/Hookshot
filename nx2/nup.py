@@ -26,7 +26,7 @@ import sys
 
 
 ZSTD = b"\x28\xb5\x2f\xfd"
-WINDOWS_DEVICES = {"CON", "PRN", "AUX", "NUL"} | {p + n for p in ("COM", "LPT") for n in "123456789¹²³"}
+WINDOWS_DEVICES = {"CON", "CONIN$", "CONOUT$", "PRN", "AUX", "NUL"} | {p + n for p in ("COM", "LPT") for n in "123456789¹²³"}
 
 
 def frame_content_size(head):
@@ -175,7 +175,7 @@ def pick_title(nup, want):
     raise SystemExit("no title %s" % want)
 
 
-def extraction_path(out, part, rel):
+def extraction_path(out, part, rel, temporary_suffix=".part"):
     """A package path stays under its part, without following existing output links."""
     parts = rel.split("/")
     if (not rel or "\\" in rel or any(not p or p in (".", "..") or p[-1] in " ." or
@@ -192,7 +192,8 @@ def extraction_path(out, part, rel):
     for p in (part, *parts):
         at = os.path.join(at, p)
         paths.append(at)
-    paths.append(dst + ".part")
+    temporary = dst + temporary_suffix
+    paths.append(temporary)
     for path in paths:
         try:
             info = os.lstat(path)
@@ -200,7 +201,7 @@ def extraction_path(out, part, rel):
             continue
         if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0):
             raise SystemExit("extraction path is a link or reparse point: %s" % path)
-        if path == dst + ".part" and info.st_nlink > 1:
+        if path == temporary and info.st_nlink > 1:
             raise SystemExit("extraction temporary file has other hard links: %s" % path)
     return dst
 
@@ -225,10 +226,10 @@ def extract(nup, t, out, only=None, quiet=False):
     return n, total
 
 
-def heal(nup, t, exefs, names):
+def heal(nup, t, out, names):
     """An update's exefs need not hold every module whole: what is not an NSO there is taken from the package's other titles"""
     for m in names:
-        p = os.path.join(exefs, m)
+        p = extraction_path(out, "exefs", m)
         have = b""
         if os.path.exists(p):
             with open(p, "rb") as f:
@@ -240,8 +241,9 @@ def heal(nup, t, exefs, names):
                 continue
             for rel, r in nup.walk(other["exefs"]):
                 if rel == m and nup.read(r, 4) == b"NSO0":
-                    with open(p, "wb") as g:
+                    with open(p + ".part", "wb") as g:
                         g.write(nup.read(r))
+                    os.replace(p + ".part", p)
                     print("  %s: taken from title %d (v%d)" % (m, other["index"], other["version"]))
                     break
             else:
@@ -280,9 +282,9 @@ def main():
         if a.only != "romfs":   # (main is ZBIC-compressed on firmware 22+: made a plain NSO for the tools)
             sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
             import unpack
-            heal(nup, t, os.path.join(a.extract, "exefs"), unpack.NAMES)
+            heal(nup, t, a.extract, unpack.NAMES)
             for m in unpack.NAMES:
-                p = os.path.join(a.extract, "exefs", m)
+                p = extraction_path(a.extract, "exefs", m, temporary_suffix=".plain")
                 if os.path.exists(p) and unpack.unpack_nso(p):
                     print("  %s: ZBIC -> plain NSO" % m)
 

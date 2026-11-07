@@ -1,11 +1,13 @@
 """Game-free extraction boundary regressions: python -I nx2/test_nup_paths.py."""
 
-from contextlib import contextmanager, ExitStack
+from contextlib import contextmanager, ExitStack, redirect_stdout
+import importlib.util
 import io
 import os
 from pathlib import Path
 import re
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -86,6 +88,23 @@ class Package:
         output.write(self.data)
 
 
+class HealingPackage(Package):
+    """The selected update is missing main; the base has an authored module."""
+    titles = [dict(index=0, id=0, version=0, exefs=0, romfs=1),
+              dict(index=1, id=0, version=1, exefs=2, romfs=3)]
+    file_size, nd, nf = 0, 4, 1
+
+    def __init__(self, data=b"NSO0authored module"):
+        super().__init__(["main"], data)
+
+    def walk(self, directory):
+        if directory == 0:
+            yield from super().walk(directory)
+
+    def read(self, record, n=None):
+        return self.data if n is None else self.data[:n]
+
+
 class ExtractionPaths(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -98,6 +117,30 @@ class ExtractionPaths(unittest.TestCase):
 
     def extract(self, names):
         return nup.extract(Package(names), {"romfs": 0}, str(self.out), only="romfs", quiet=True)
+
+    def heal(self):
+        package = HealingPackage()
+        with redirect_stdout(io.StringIO()):
+            nup.heal(package, package.titles[-1], str(self.out), ["main"])
+
+    def unpack(self):
+        # This authored empty-segment NSO exercises the real unpack writer, without compressed game data.
+        raw = bytearray(0x100)
+        raw[:4] = b"NSO0"
+        struct.pack_into("<I", raw, 0xC, 1 << 7)
+        for i in range(3):
+            struct.pack_into("<I", raw, 0x10 + 0x10 * i, 0x100)
+        (self.out / "exefs" / "main").write_bytes(raw)
+        spec = importlib.util.spec_from_file_location("unpack_fixture", Path(nup.__file__).with_name("unpack.py"))
+        unpacker = importlib.util.module_from_spec(spec)
+        # No compressed segment may call the project's native decompressor in this fixture.
+        with patch.dict(sys.modules, {"zbic": object()}):
+            spec.loader.exec_module(unpacker)
+        unpacker.NAMES = ["main"]
+        with patch.object(nup, "Nup", return_value=HealingPackage(bytes(raw))), \
+                patch.object(sys, "argv", ["nup.py", "authored.nup", "--extract", str(self.out)]), \
+                patch.dict(sys.modules, {"unpack": unpacker}), redirect_stdout(io.StringIO()):
+            return nup.main()
 
     def reject(self, names, message):
         before = snapshot(self.root)
@@ -129,7 +172,8 @@ class ExtractionPaths(unittest.TestCase):
                  "/rooted.bin", "//server/share/file.bin", r"\rooted.bin", r"\\server\share\file.bin",
                  r"C:\outside.bin", "C:/outside.bin", "C:outside.bin", r"nested\..\outside.bin",
                  "nested//file.bin", "nested/.. /outside.bin", "file:stream", "trailing.", "trailing ",
-                 "control\x00.bin", "CON", "aux.txt", "NUL.bin", "COM1", "LPT9.txt", "COM¹.txt"]
+                 "control\x00.bin", "CON", "aux.txt", "NUL.bin", "COM1", "LPT9.txt", "COM¹.txt",
+                 "CONIN$", "conout$", "nested/CONIN$", "nested/ConOut$"]
         for name in names:
             with self.subTest(name=name):
                 # Even a broken validator must not let the fixture touch an absolute path or UNC share.
@@ -202,6 +246,7 @@ class ExtractionPaths(unittest.TestCase):
 
     def test_destination_link_is_rejected_before_resume(self):
         (self.out / "romfs").mkdir()
+        self.sentinel.write_bytes(b"authored fixture")
         try:
             os.symlink(self.sentinel, self.out / "romfs" / "file.bin")
         except OSError as error:
@@ -220,6 +265,95 @@ class ExtractionPaths(unittest.TestCase):
         (self.out / "romfs").mkdir()
         os.link(self.sentinel, self.out / "romfs" / "file.bin.part")
         self.reject(["file.bin"], "extraction temporary file has other hard links: ")
+
+    def test_heal_missing_module_and_resume(self):
+        (self.out / "exefs").mkdir()
+        self.heal()
+        self.assertEqual((self.out / "exefs" / "main").read_bytes(), b"NSO0authored module")
+        before = snapshot(self.root)
+        self.heal()
+        self.assertEqual(before, snapshot(self.root))
+
+    def test_heal_directory_link_cannot_redirect_module(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        self.directory_link(self.out / "exefs", outside)
+        before = snapshot(self.root)
+        with self.assertRaisesRegex(SystemExit, "^extraction path is a link or reparse point: "):
+            self.heal()
+        self.assertEqual(before, snapshot(self.root))
+
+    def test_heal_directory_reparse_point_cannot_redirect_module(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        link = self.out / "exefs"
+        if os.name == "nt":
+            result = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(outside)],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        else:
+            os.symlink(outside, link, target_is_directory=True)
+        before = snapshot(self.root)
+        with self.assertRaisesRegex(SystemExit, "^extraction path is a link or reparse point: "):
+            self.heal()
+        self.assertEqual(before, snapshot(self.root))
+
+    def test_heal_destination_link_cannot_truncate_an_outside_file(self):
+        (self.out / "exefs").mkdir()
+        os.symlink(self.sentinel, self.out / "exefs" / "main")
+        before = snapshot(self.root)
+        with self.assertRaisesRegex(SystemExit, "^extraction path is a link or reparse point: "):
+            self.heal()
+        self.assertEqual(before, snapshot(self.root))
+
+    def test_heal_destination_hard_link_is_replaced_without_truncation(self):
+        (self.out / "exefs").mkdir()
+        module = self.out / "exefs" / "main"
+        os.link(self.sentinel, module)
+        self.heal()
+        self.assertEqual(self.sentinel.read_bytes(), b"keep outside data")
+        self.assertEqual(module.read_bytes(), b"NSO0authored module")
+
+    def test_heal_temporary_link_cannot_truncate_an_outside_file(self):
+        (self.out / "exefs").mkdir()
+        os.symlink(self.sentinel, self.out / "exefs" / "main.part")
+        before = snapshot(self.root)
+        with self.assertRaisesRegex(SystemExit, "^extraction path is a link or reparse point: "):
+            self.heal()
+        self.assertEqual(before, snapshot(self.root))
+
+    def test_heal_temporary_hard_link_cannot_truncate_an_outside_file(self):
+        (self.out / "exefs").mkdir()
+        os.link(self.sentinel, self.out / "exefs" / "main.part")
+        before = snapshot(self.root)
+        with self.assertRaisesRegex(SystemExit, "^extraction temporary file has other hard links: "):
+            self.heal()
+        self.assertEqual(before, snapshot(self.root))
+
+    def test_unpack_temporary_link_cannot_truncate_an_outside_file(self):
+        (self.out / "exefs").mkdir()
+        os.symlink(self.sentinel, self.out / "exefs" / "main.plain")
+        # unpack() creates only the authored module before entering nup.main's production path.
+        with self.assertRaisesRegex(SystemExit, r"^extraction path is a link or reparse point: .*main\.plain$"):
+            self.unpack()
+        self.assertEqual(self.sentinel.read_bytes(), b"keep outside data")
+        self.assertTrue((self.out / "exefs" / "main.plain").is_symlink())
+
+    def test_unpack_temporary_hard_link_cannot_truncate_an_outside_file(self):
+        (self.out / "exefs").mkdir()
+        os.link(self.sentinel, self.out / "exefs" / "main.plain")
+        with self.assertRaisesRegex(SystemExit, r"^extraction temporary file has other hard links: .*main\.plain$"):
+            self.unpack()
+        self.assertEqual(self.sentinel.read_bytes(), b"keep outside data")
+
+    def test_unpack_ordinary_temporary_file_is_replaced(self):
+        (self.out / "exefs").mkdir()
+        (self.out / "exefs" / "main.plain").write_bytes(b"interrupted unpack")
+        self.unpack()
+        module = (self.out / "exefs" / "main").read_bytes()
+        self.assertEqual(module[:4], b"NSO0")
+        self.assertEqual(struct.unpack_from("<I", module, 0xC)[0], 0)
+        self.assertFalse((self.out / "exefs" / "main.plain").exists())
 
 
 if __name__ == "__main__":
