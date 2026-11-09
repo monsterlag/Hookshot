@@ -196,6 +196,26 @@ void check_success() {
     CHECK(arguments == fixed); CHECK(p->binding_types.size() == 7);
 #endif
     cleanup(*p);
+    // A fallback needs its buffer addresses even without render-area/global-memory push users.
+    for (bool fallback : {false, true}) {
+        auto make = [&] {
+            auto q=program(false); q->fallback=fallback;
+            for (auto& st : q->stages) st.info.uses_render_area=st.info.uses_global_memory=false;
+            return q;
+        };
+        arguments.clear(); next_handle=100;
+        p=make(); CHECK(ensure_layout(*p));
+        CHECK(!p->uses_render_area && p->uses_push == fallback);
+        CHECK(p->binding_types.size() == 7 && p->push);
+#ifdef HAVE_ORIGINAL_HELPER
+        const auto fallback_args=arguments; cleanup(*p);
+        CHECK(sets.empty() && layouts.empty() && modules.empty());
+        arguments.clear(); next_handle=100;
+        p=make(); ensure_layout_original(*p);
+        CHECK(arguments == fallback_args && p->uses_push == fallback);
+#endif
+        cleanup(*p);
+    }
 }
 void check_draw_dispatch() {
     for (int fail : {1,2}) {

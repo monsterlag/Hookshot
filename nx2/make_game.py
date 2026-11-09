@@ -91,6 +91,20 @@ def failure_reason(lines):
     return tail[-1] if tail else "no output"
 
 
+def killed_reason():
+    """(issues 478, 768, 807) A step stopped by SIGKILL or SIGTERM from outside the build: the builder's own Cancel stops make_game
+    with it, so this is the system's, the kernel's or a desktop's low-memory killer most likely. Its last lines then said nothing
+    of that (the lift's emit processes failing on their result pipe, BrokenPipeError, or the lift's last progress line)"""
+    total = None
+    try:
+        with open("/proc/meminfo") as f:
+            total = next((round(int(l.split()[1]) / (1 << 20)) for l in f if l.startswith("MemTotal:")), None)   # (kB, to the nearest GB)
+    except (OSError, ValueError, IndexError):
+        pass
+    return ("the system stopped it, most likely because the PC ran out of memory%s. Close other programs and build again"
+            % (" (%d GB here)" % total if total else ""))
+
+
 def reported(line):
     """The sentence a builder shows. @@check is '@@check <ok|bad> <text>'; @@error is '@@error <text>'. None otherwise."""
     if line.startswith("@@error "):
@@ -218,7 +232,7 @@ def run(cmd, env=None, on_line=None, check=True, output=None):
     if code and check:
         step = next((os.path.basename(c) for c in cmd[1:] if c.endswith(".py")), os.path.basename(cmd[-1]))   # (issue 154: not "-u")
         status = "signal %d" % -code if os.name == "posix" and code < 0 else "exit status %d" % code
-        fail("%s stopped (%s): %s" % (step, status, failure_reason(lines)))
+        fail("%s stopped (%s): %s" % (step, status, killed_reason() if os.name == "posix" and -code in (9, 15) else failure_reason(lines)))
     return code
 
 

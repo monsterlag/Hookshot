@@ -50,6 +50,16 @@ struct Program {
     bool uses_render_area = false;
     bool uses_push = true;   // (a stage reads the push constants: render area or rescaling)
     bool mesh = false;              // task / mesh stages (VK_EXT_mesh_shader)
+    // (hookshot) the GPU has no mesh shaders: the task and mesh stages are compute pipelines, and a generated vertex
+    // stage reads the records they write. Its stages are (task,) mesh, vertex, fragment.
+    bool fallback = false;
+    bool fallback_task = false;   // (a task stage before the mesh stage: its payloads are per mesh workgroup)
+    VkPrimitiveTopology fallback_topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    uint32_t fallback_vertices_per_workgroup = 1;   // (max primitives x corners: the records of one mesh workgroup)
+    uint32_t fallback_record_words = 1;             // (validity, then the vertex and primitive lines)
+    uint32_t fallback_payload_words = 0;
+    uint32_t fallback_task_threads = 1;             // (mesh workgroups one task workgroup may start)
+    std::vector<VkPipeline> fallback_compute;       // (per stage: the mesh program's dispatches)
     // What the translator was told about the bound textures (when it asked: most texture instructions carry their
     // type themselves), by stage and texture descriptor: the variant stands while the textures still answer the same
     struct Answer {

@@ -11,7 +11,8 @@
    aux effects pass through. Played sample counts and released wave buffers go back to the game as on hardware.
    The game's parameter changes take effect together at RequestUpdateAudioRenderer, and volume changes ramp over a
    frame, as the console's renderer does them (see "parameter updates").
-   HOS_AUDIO_DUMP=<file.wav>: also write what is played (checking without speakers); HOS_AUDIO=0: silence. */
+   HOS_AUDIO_DUMP=<file.wav>: also write what is played (checking without speakers); HOS_AUDIO=0: silence;
+   HOS_AUDIO_DEVICE=<n>: that waveOut device first; HOS_AUDIO_MUTE=1: the device fed at volume 0 (test runs). */
 #include "hos.h"
 #include <math.h>
 #include <stdio.h>
@@ -563,6 +564,31 @@ static void render_frame(int16_t *pcm) {   /* 240 stereo frames */
     }
 }
 
+/* (the output's platform parts, outside the section tests/audio_output_errors_test.c compiles with its own) */
+static unsigned au_device_count(void) {
+#ifdef _WIN32
+    return waveOutGetNumDevs();
+#else
+    return 0;   /* (linux: waveOut is SDL's default device) */
+#endif
+}
+static void au_device_name(unsigned device, char *out, size_t size) {
+    snprintf(out, size, "device %u", device);
+#ifdef _WIN32
+    WAVEOUTCAPSA caps;
+    if (waveOutGetDevCapsA(device, &caps, sizeof caps) == MMSYSERR_NOERROR) snprintf(out, size, "%s", caps.szPname);
+#endif
+}
+static uint64_t au_ms(void) { return (uint64_t)GetTickCount64(); }
+/* HOS_AUDIO_MUTE=1 (test runs): the device opened and fed as for a player, at volume 0 */
+static void au_opened(HWAVEOUT w) {
+#ifdef _WIN32
+    if (getenv("HOS_AUDIO_MUTE")) waveOutSetVolume(w, 0);
+#else
+    (void)w;
+#endif
+}
+
 /* ---- output: waveOut, 10 ms blocks; a WAV file with HOS_AUDIO_DUMP ---------------------------------------------- */
 #define NBLOCKS 10
 static HWAVEOUT wout;
@@ -579,12 +605,42 @@ static void output_error(const char *operation, MMRESULT result) {
         hos_log("audio: %s failed (MMRESULT %u)", operation, (unsigned)result);
     }
 }
+/* The device: HOS_AUDIO_DEVICE=<n> (a waveOut device number) first, then the Windows default (WAVE_MAPPER), then each
+   device in turn. Players had no sound at all while every other program played ("no sound in 2.0.5"): the log now
+   names the device; one that takes no block for 1.5 s (an unplugged headset, a default bound to a dead output) is
+   closed and the next candidate opened (at most 6 times a run); 10 s after opening the log says how many blocks the
+   device took and how loud the game's sound was, which tells a silent game from a deaf device. */
+static int out_next;           /* the next candidate: 0 = HOS_AUDIO_DEVICE, 1 = the default, 2.. = device n-2 */
+static uint64_t out_opened, out_stall_since;
+static unsigned out_played, out_peak, out_reported;
+static int output_try(int candidate, const WAVEFORMATEX *f) {
+    const char *want = getenv("HOS_AUDIO_DEVICE");
+    unsigned device;
+    if (candidate == 0) {
+        if (!want || !*want) return 0;
+        device = (unsigned)atoi(want);
+    } else device = candidate == 1 ? WAVE_MAPPER : (unsigned)(candidate - 2);
+    const MMRESULT result = waveOutOpen(&wout, device, f, 0, 0, CALLBACK_NULL);
+    if (result != MMSYSERR_NOERROR) {
+        output_error("waveOutOpen", result);
+        wout = NULL;
+        return 0;
+    }
+    au_opened(wout);
+    char name[64];
+    if (device == WAVE_MAPPER) snprintf(name, sizeof name, "the default device");
+    else au_device_name(device, name, sizeof name);
+    hos_log("audio: output on %s (%u devices)", name, au_device_count());
+    return 1;
+}
 static void output_open(void) {
+    static int dump_done;
     const char *d = getenv("HOS_AUDIO_DUMP");
-    if (d && (dump = fopen(d, "wb")) != NULL) {
+    if (!dump_done && d && (dump = fopen(d, "wb")) != NULL) {
         static const uint8_t z[44];
         fwrite(z, 1, 44, dump);
     }
+    dump_done = 1;
     if (getenv("HOS_AUDIO") && atoi(getenv("HOS_AUDIO")) == 0) return;
     WAVEFORMATEX f = {0};
     f.wFormatTag = WAVE_FORMAT_PCM;
@@ -593,17 +649,35 @@ static void output_open(void) {
     f.wBitsPerSample = 16;
     f.nBlockAlign = 4;
     f.nAvgBytesPerSec = RATE * 4;
-    const MMRESULT result = waveOutOpen(&wout, WAVE_MAPPER, &f, 0, 0, CALLBACK_NULL);
-    if (result != MMSYSERR_NOERROR) {
-        output_error("waveOutOpen", result);
-        wout = NULL;
-        return;
+    const int candidates = 2 + (int)au_device_count();
+    for (int tried = 0; tried < candidates && !wout; tried++) {
+        const int c = out_next;
+        out_next = (out_next + 1) % candidates;
+        output_try(c, &f);
     }
+    if (!wout) return;
     for (int i = 0; i < NBLOCKS; i++) {
+        memset(&hdr[i], 0, sizeof hdr[i]);
         hdr[i].lpData = (LPSTR)blocks[i];
         hdr[i].dwBufferLength = sizeof blocks[i];
         hdr[i].dwFlags = WHDR_DONE;
     }
+    fill_block = fill_frames = 0;
+    out_opened = au_ms();
+    out_stall_since = 0;
+    out_played = out_peak = out_reported = 0;
+}
+static void output_reopen(void) {
+    static int reopens;
+    out_stall_since = 0;
+    if (++reopens > 6) return;
+    hos_log("audio: the output device took no sound for 1.5 s: trying the next one");
+    waveOutReset(wout);
+    for (int i = 0; i < NBLOCKS; i++)
+        if (hdr[i].dwFlags & WHDR_PREPARED) waveOutUnprepareHeader(wout, &hdr[i], sizeof hdr[i]);
+    waveOutClose(wout);
+    wout = NULL;
+    output_open();
 }
 static void dump_finish(void) {
     if (!dump) return;
@@ -638,9 +712,24 @@ static void output_frame(const int16_t *pcm) {
         }
     }
     if (!wout) return;
+    for (int i = 0; i < FRAME * 2; i++) {
+        const unsigned a = (unsigned)(pcm[i] < 0 ? -pcm[i] : pcm[i]);
+        if (a > out_peak) out_peak = a;
+    }
+    if (!out_reported && au_ms() - out_opened > 10000) {
+        out_reported = 1;
+        hos_log("audio: %u blocks played in the first 10 s, loudest sample %u of 32767%s", out_played, out_peak,
+                out_played == 0 ? " (the device takes nothing)" : out_peak == 0 ? " (the game sent silence)" : "");
+    }
     WAVEHDR *h = &hdr[fill_block];
     if (fill_frames == 0) {
-        if (!(h->dwFlags & WHDR_DONE)) return;   /* the device is behind: this frame is dropped */
+        if (!(h->dwFlags & WHDR_DONE)) {   /* the device is behind: this frame is dropped */
+            const uint64_t now = au_ms();
+            if (!out_stall_since) out_stall_since = now;
+            else if (now - out_stall_since > 1500) output_reopen();
+            return;
+        }
+        out_stall_since = 0;
         if (h->dwFlags & WHDR_PREPARED) {
             const MMRESULT result = waveOutUnprepareHeader(wout, h, sizeof *h);
             if (result != MMSYSERR_NOERROR) {
@@ -657,6 +746,7 @@ static void output_frame(const int16_t *pcm) {
         if (result == MMSYSERR_NOERROR) {
             operation = "waveOutWrite";
             result = waveOutWrite(wout, h, sizeof *h);
+            if (result == MMSYSERR_NOERROR) out_played++;
         }
         if (result != MMSYSERR_NOERROR) {
             output_error(operation, result);

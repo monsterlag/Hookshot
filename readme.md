@@ -12,6 +12,7 @@
 <h4 align="center">The Legend of Zelda: Ocarina of Time (Nintendo Switch 2) running natively on Windows & Linux, with no emulator.
 </h4>
 
+
 <p align="center">
   <a href="#project-status">Status</a> |
   <a href="#install-and-play">Install and play</a> |
@@ -28,6 +29,10 @@ Hookshot is a static recompilation. The game's code is translated to C and compi
 the console's system software is reimplemented, and the Switch 2 graphics are rebuilt on Vulkan. All of this happens
 **on your PC, from your own copy of the game**.
 <br>
+
+> [!WARNING]
+> Some users report the file in releases to be a Trojan - it is not. Feel free to run it through any antivirus software
+
 
 Discord: https://discord.gg/DVQQJphbBf
 <br>
@@ -152,7 +157,8 @@ with `--update <game folder>`.
   Windows, **Free up space** on the "Your game is ready" page deletes them, and the build files folder can be moved
   before a build (**Change**, **Default**).
 - Saves: the `user` folder in the game folder on Windows, `~/.local/share/hookshot` on Linux (a `user` folder from an
-  earlier Linux build is moved there once).
+  earlier Linux build is moved there once). `--user <folder>` puts them somewhere else ([command line
+  arguments](#running-the-game-from-the-command-line)).
 - To uninstall, delete the game folder, the builder's folder and the shortcuts.
 
 ### If something goes wrong
@@ -187,7 +193,8 @@ and the right one closes the menu. Your choices are saved in `hookshot_options.i
 | | GPU device | Auto, or each graphics card by name (after a restart) | Auto |
 | | Frame generation | Off, 2x to 8x | Off |
 | | Frame pacing | Off, On | Off |
-| | Resolution | Auto (the game's own dynamic resolution), 100%, 75%, 67%, 50% | Auto |
+| | Resolution | Auto (the game's own dynamic resolution), 100%, 75%, 67%, 50% (each with its size) | Auto |
+| | Output resolution | 2048x1152, 2560x1440, 3840x2160 (after a restart) | 2048x1152 |
 | | Upscaling | Off, Catmull-Rom, Lanczos | Off |
 | | Sharpness | 0 to 100%, in steps of 10 | 0% |
 | | Handheld profile | Off, On (after a restart) | Off |
@@ -214,6 +221,9 @@ and the right one closes the menu. Your choices are saved in `hookshot_options.i
   over the menu.
 - **Frame generation** makes extra frames between the game's own. It adds a little input delay, and fast motion can
   show artifacts. **Frame pacing** shows frames at an even interval: less stutter, up to one frame of delay.
+- **Output resolution** is the size of the game's whole frame, HUD included, before it is scaled to your window.
+  Resolution is a share of it, and its row shows the size for the output you chose. Docked only. At 3840x2160 the game's
+  render targets get a bigger GPU pool, so a full-size 3D fits. `HOS_OUTPUT_RES=0/1/2` sets it for one run.
 - **Upscaling** and **Sharpness** also work when Frame generation is Off.
 - **Handheld profile** runs the game as if the console were undocked: lower resolution, lighter on the GPU.
 - **Robust buffers:** a read past a buffer's end is dropped instead of stopping the GPU. Auto is on, on every card; Off
@@ -348,6 +358,35 @@ Unpack llvm-mingw's Linux build (`ucrt-ubuntu-22.04-x86_64`), then run `make_gam
 The game folder runs under Proton or on Windows.
 
 </details>
+
+### Running the game from the command line
+
+The built game is `bin\hookshot.exe` on Windows and `bin/hookshot` in a packaged Linux game folder. A build from a
+source checkout has `hookshot.exe` or `hookshot` in its build folder, with no launcher beside it. The `hookshot.exe`
+or `hookshot` launcher in the game folder does not pass these arguments to the game, so start the game directly to
+use them.
+
+| Argument | What it does |
+|---|---|
+| `image.bin` | The game image to run. Without it the game uses the `image.bin`, `romfs` and `user` in its folder |
+| `--romfs <folder>` | The extracted RomFS folder |
+| `--user <folder>` | Where the game keeps per-user data: saves, caches, temp files and `mouse_sens.txt`. Default: `user` in the game folder on Windows, `~/.local/share/hookshot` on Linux; with an explicit image path, `user` in the current folder |
+| `--trace` | Log every Horizon OS call (the same as `HOS_TRACE=1`) |
+| `--prepare-shaders` | Prepare the shaders and exit without starting the game (the build's last step) |
+
+For example, keep saves somewhere else:
+
+```powershell
+cd "C:\Games\Hookshot"
+.\bin\hookshot.exe --user "D:\Hookshot data"
+```
+
+```sh
+cd ~/Games/Hookshot
+./bin/hookshot --user "$HOME/hookshot-data"
+```
+
+`hookshot_env.txt` and the other test switches are documented below.
 
 <details>
 <summary>Switches for testing (hookshot_env.txt)</summary>

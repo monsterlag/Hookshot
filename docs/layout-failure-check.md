@@ -30,6 +30,8 @@ For a baseline comparison, save the original `gpu/vk/vk_draw.cpp` outside the so
 tree and pass its path with `--baseline-source`. The check compares successful API
 arguments for authored vertex/fragment descriptors and verifies that the original
 helper calls a dependent API after a failed descriptor-set allocation.
+The success case also checks that mesh-fallback buffer addresses require push
+constants even when render-area and global-memory push users are absent.
 
 No Vulkan driver, game data or GPU is used. The draw/dispatch wrappers observe the
 actual early-return blocks, not the rest of the renderer. Cached workers execute

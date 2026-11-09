@@ -340,10 +340,34 @@ static int retryable(DWORD status) {
     return !status || status >= 500 || status == 200 || status == 408 || status == 429 || status == 403;
 }
 
+/* (the release the builder asked for: --tag <t> in the arguments, "" when none) */
+static void wanted_tag(char *out, size_t n) {
+    out[0] = 0;
+    const wchar_t *t = wcsstr(g_cmdline, L"--tag ");
+    if (!t) return;
+    t += 6;
+    while (*t == L' ' || *t == L'"') t++;
+    size_t k = 0;
+    while (*t && *t != L' ' && *t != L'"' && k + 1 < n) {
+        const wchar_t c = *t++;
+        if (!((c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || c == L'.' || c == L'-' || c == L'_'))
+            { out[0] = 0; return; }
+        out[k++] = (char)c;
+    }
+    out[k] = 0;
+}
+
+/* (an update to a named release reads THAT release's list: the latest/download link can answer with the release before it for a
+   while after a publish, and the setup then installed the old version again and started it with --fetched, which builds without
+   checking: players pressed Update and stayed on v2.0.3, 2026-11-08) */
 static const char *manifest_url(void) {
     static char u[1024];
     const char *e = getenv("HOOKSHOT_SETUP_LIST");
-    snprintf(u, sizeof u, "%s", e && *e ? e : "https://github.com/NotRexed/Hookshot/releases/latest/download/hookshot-setup.txt");
+    char tag[128];
+    wanted_tag(tag, sizeof tag);
+    if (e && *e) snprintf(u, sizeof u, "%s", e);
+    else if (tag[0]) snprintf(u, sizeof u, "https://github.com/NotRexed/Hookshot/releases/download/%s/hookshot-setup.txt", tag);
+    else snprintf(u, sizeof u, "%s", "https://github.com/NotRexed/Hookshot/releases/latest/download/hookshot-setup.txt");
     return u;
 }
 
@@ -413,6 +437,16 @@ static DWORD WINAPI work(LPVOID unused) {
         }
     }
     if (!tag[0] || !run[0] || !nparts) fail(L"The release's setup list could not be read. Try again later.");
+    {
+        char want[128];
+        wanted_tag(want, sizeof want);
+        if (want[0] && strcmp(want, tag)) {
+            wchar_t ww[128], wt[128];
+            MultiByteToWideChar(CP_UTF8, 0, want, -1, ww, 128), MultiByteToWideChar(CP_UTF8, 0, tag, -1, wt, 128);
+            fail(L"GitHub answered with the setup list of %ls, not %ls (its download links can lag right after a release). Try the "
+                 L"update again in a few minutes.", wt, ww);
+        }
+    }
 
     wchar_t install[MAX_PATH], marker[MAX_PATH], wtag[128], wrun[260], exe[MAX_PATH], versions[MAX_PATH], final_dir[MAX_PATH];
     w(tag, wtag, 128), w(run, wrun, 260);

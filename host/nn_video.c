@@ -139,6 +139,19 @@ HLE(_ZN2nn5codec26InitializeDecoderImagePoolEPNS0_25VideoDecoderImagePoolTypeEPv
     o->rgba = (uint8_t *)calloc((size_t)o->count, (size_t)o->w * o->h * 4);
     /* (hookshot, issue 342: an allocation that failed went on as a NULL picture, and the movie thread read address 0) */
     o->nv12 = (uint8_t *)calloc((size_t)o->count, (size_t)o->w * o->h * 3 / 2);
+    /* (hookshot) video black, not zeros. A buffer the game takes before the decoder's first picture is shown as it is
+       (dec_acquire: "nothing decoded, the buffer again", up to ~100 ms into a movie's start), and NV12 zeros are bright
+       green (luma 0 with no chroma): one green frame at each scene change that opens a movie. Luma 16, chroma 128 is
+       black; the RGBA opaque black */
+    if (o->nv12) {
+        for (int i = 0; i < o->count; i++) {
+            uint8_t *img = o->nv12 + (size_t)i * o->w * o->h * 3 / 2;
+            memset(img, 0x10, (size_t)o->w * o->h);
+            memset(img + (size_t)o->w * o->h, 0x80, (size_t)o->w * o->h / 2);
+        }
+    }
+    if (o->rgba)
+        for (size_t k = 3; k < (size_t)o->count * o->w * o->h * 4; k += 4) o->rgba[k] = 0xff;
     o->mem = ARG(1), o->mem_size = ARG(2);
     if (video_log())
         hos_log("video: image pool %#llx: %dx%d format %d, %d images, memory %#llx+%#llx", (unsigned long long)ARG(0),
@@ -553,6 +566,8 @@ static void dec_acquire(Ctx *c) {
             G64(ARG(1)) = SYNC_IDLE_TAG | ((uint64_t)InterlockedCompareExchange64(&submissions, 0, 0) & SYNC_IDLE_MASK);
         if (video_log()) hos_log("video: acquire %lld: nothing decoded%s, buffer %d again", (long long)d->acquires,
                                  d->eos ? " (the end)" : idle ? " (idle: its sync not reached)" : "", slot);
+        else if (d->acquires == 1 && !d->eos)   /* (the start: the frame shows the buffer as it was, black since the pool's fill) */
+            hos_log("video: the first buffer went out before the first picture was decoded (shown black)");
         ReleaseSRWLockExclusive(&d->lock);
         if (ARG(0)) G32(ARG(0)) = (uint32_t)slot;
         RET(0);

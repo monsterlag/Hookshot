@@ -715,7 +715,12 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
             pc.native_tiling = 1;
             for (size_t k0 = 0; k0 < layers.size();) {
                 size_t k1 = k0 + 1;
-                while (k1 < layers.size() && k1 - k0 < kBcLayers && layers[k1] == layers[k1 - 1] + 1) k1++;
+                // (one layer a run: with runs of up to kBcLayers, an array's layers past the run's first came out wrong in the
+                // smaller levels, and Hyrule Field's ground, which samples the terrain's material arrays (1365 x 1365 x 90, ASTC
+                // 8x8) at those levels from a distance, had its tiles outlined in dark lines (RX 6600: none with one layer a run,
+                // nor with the arrays kept as RGBA8). RX_VK_BC_LAYERS=<n>: up to n a run)
+                static const uint32_t run = getenv("RX_VK_BC_LAYERS") ? std::clamp<uint32_t>((uint32_t)atoi(getenv("RX_VK_BC_LAYERS")), 1u, kBcLayers) : 1u;
+                while (k1 < layers.size() && k1 - k0 < run && layers[k1] == layers[k1 - 1] + 1) k1++;
                 const uint32_t n = (uint32_t)(k1 - k0);
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, astc_pipe);
                 const uint64_t from = k0 * tail + off;
@@ -1502,16 +1507,16 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
         // it on an RX 6600 XT; an RX 6700 XT here). On AMD such a texture is encoded at the nearest size whose blocks halve
         // evenly down to its 16-texel levels (1365 -> 1536, 683 -> 768; 768 and 1536 stay) and keeps only the levels that
         // halve evenly: the game samples with normalized coordinates, so a resized level covers the same area. Where that
-        // would grow it by more than a quarter, or past the scratch, it stays RGBA8. RX_VK_UNEVEN_BC=1: BC3 as before;
-        // =0: this on other cards too. RX_VK_UNEVEN_RGBA8=1: RGBA8 instead of resizing.
+        // would grow it by more than a quarter, or past the scratch, it stays RGBA8. RX_VK_UNEVEN_RGBA8=1: RGBA8 instead of resizing.
+        // OFF by default since v2.0.6: in v2.0.5 an RX 6700 XT's GPU time went from 10-13 ms to 70-100 ms a frame in play
+        // with it (issue 823, logs of both versions), and AMD players saw rainbow ground (Discord). RX_VK_UNEVEN_BC=0: on
+        // (every card); unset or 1: BC3 as in v2.0.4.
         using bc_levels::first_uneven;
         using bc_levels::even_size;
         const bool uneven = first_uneven(x.width, x.height, x.levels) < x.levels;
         static const bool amd_fix = [] {
             if (const char* e = getenv("RX_VK_UNEVEN_BC")) return e[0] == '0';
-            VkPhysicalDeviceProperties pr{};
-            vkGetPhysicalDeviceProperties(dev.physical, &pr);
-            return pr.vendorID == 0x1002;
+            return false;
         }();
         static const bool rgba8_instead = getenv("RX_VK_UNEVEN_RGBA8") != nullptr;
         const bool bc_candidate = astc && !(x.skip && x.layers == 1) && x.type == VK_IMAGE_TYPE_2D &&

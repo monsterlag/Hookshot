@@ -32,6 +32,10 @@ public partial class MainWindow : Window
     string? current;
     string finished = "";
     string? chosenNup, romfs, exefs;
+    // (issue 650) "Using the folders ..." above the list of .nup files, while romfs and exefs are the game files: FillDumps clears the
+    // list, so the note is made there again each time (it was gone as soon as the list was first filled)
+    string? foldersNote;
+    TextBlock? foldersNoteBlock;
     bool updating, checking;
     double compiled;
     int filesDone, filesOf;
@@ -269,8 +273,7 @@ public partial class MainWindow : Window
         {
             romfs = s.Romfs;
             exefs = s.Exefs;
-            DumpList.Children.Insert(0, new TextBlock { Text = $"Using the folders {romfs} and {exefs} (as last time)", Style = (Style)FindResource("Note"),
-                                                        Margin = new Thickness(16, 12, 16, 12) });
+            foldersNote = $"Using the folders {romfs} and {exefs} (as last time)";
         }
         else if (s.Nup != null && File.Exists(s.Nup))
         {
@@ -413,6 +416,12 @@ public partial class MainWindow : Window
     void FillDumps()
     {
         DumpList.Children.Clear();
+        foldersNoteBlock = null;
+        if (romfs != null && exefs != null && foldersNote != null)
+        {
+            foldersNoteBlock = new TextBlock { Text = foldersNote, Style = (Style)FindResource("Note"), Margin = new Thickness(16, 12, 16, 12) };
+            DumpList.Children.Add(foldersNoteBlock);
+        }
         if (dumps.Count == 0)
         {
             DumpList.Children.Add(new TextBlock
@@ -476,11 +485,12 @@ public partial class MainWindow : Window
                 ShowProblem(r.Text, tools: true);
                 return;
             }
-            if (chosenNup == null && r.Ok) chosenNup = d.Path;
+            // (issue 650: not over the romfs and exefs folders the player chose, here or last time: the found .nup showed as chosen)
+            if (chosenNup == null && romfs == null && r.Ok) chosenNup = d.Path;
             FillDumps();
             Refresh();
         }
-        if (chosenNup == null && dumps.Count > 0 && tools != null) { chosenNup = dumps[0].Path; FillDumps(); }
+        if (chosenNup == null && romfs == null && dumps.Count > 0 && tools != null) { chosenNup = dumps[0].Path; FillDumps(); }
         checking = false;
         Refresh();
     }
@@ -490,6 +500,8 @@ public partial class MainWindow : Window
         sourcePicked = true;
         chosenNup = path;
         romfs = exefs = null;
+        if (foldersNoteBlock != null) DumpList.Children.Remove(foldersNoteBlock);   // (not the whole list again: this row's own event)
+        foldersNoteBlock = null;
         Refresh();
     }
 
@@ -574,8 +586,8 @@ public partial class MainWindow : Window
         romfs = r;
         exefs = x;
         chosenNup = null;
-        foreach (var rb in DumpList.Children.OfType<RadioButton>()) rb.IsChecked = false;
-        DumpList.Children.Insert(0, new TextBlock { Text = $"Using the folders {r} and {x}", Style = (Style)FindResource("Note"), Margin = new Thickness(16, 12, 16, 12) });
+        foldersNote = $"Using the folders {r} and {x}";
+        FillDumps();
         Refresh();
     }
 

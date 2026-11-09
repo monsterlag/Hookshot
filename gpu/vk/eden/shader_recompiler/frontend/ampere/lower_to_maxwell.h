@@ -201,6 +201,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         RegisterRun renamed[8];
         u32 nrenamed = 0;
         std::array<bool, 256> marker_taken{};
+        std::array<bool, 256> native_occupied{};
         {
             const u32 renameable = RenameableFields(opcode);
             constexpr u32 bits[4]{16, 24, 32, 64};
@@ -208,6 +209,11 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const auto span_of = [](u32 reg) { return (reg & 1) ? 1U : (reg & 2) ? 2U : 4U; };
             for (u32 f = 0; f < 4; ++f) {   // what may be native high GPRs, and which are to be renamed
                 const u32 bit = bits[f], reg = insn.Bits(bit, 8);
+                // Survey all original operands before rewriting any of them. A marker chosen for
+                // an early field must not alias a later source (including GPRs below reserved_base).
+                // Keep the same conservative pair/quad spans used for high-register accesses.
+                for (u32 k = 0; k < span_of(reg) && reg + k < 255; ++k)
+                    native_occupied[reg + k] = true;
                 // (ISBEWR's data too: not counted, a mesh program's output held in a high GPR was read from the plain register,
                 // never written, while what computes it wrote the extended one: vertices past the first 32 came out undefined.
                 // SUST and SURED's data as well, the same field. (amd-fix, Lichii #149) RED's too: a reduction's data in a high GPR
@@ -234,7 +240,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                     for (u32 m = 216; m + span <= 246 && marker == 255; m += span) {
                         bool ok = true;
                         for (u32 k = 0; k < span && ok; ++k)
-                            ok = m + k != 239 && !avoid[m + k] && !marker_taken[m + k] && !native_high[m + k];
+                            ok = m + k != 239 && !avoid[m + k] && !marker_taken[m + k] && !native_occupied[m + k];
                         if (ok) marker = m;
                     }
                     if (marker != 255 && nrenamed < 8) {

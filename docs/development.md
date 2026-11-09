@@ -35,6 +35,9 @@ Run everything with `python -I` from this folder.
 
 The dump can also come from `OOT_DUMP` (its folder) or `OOT_EXEFS`; `OOT_WORK` moves the work folder.
 
+The built game's own arguments (`image.bin`, `--romfs`, `--user`, `--trace`, `--prepare-shaders`) are in the README's
+[Running the game from the command line](../readme.md#running-the-game-from-the-command-line).
+
 Scripted test input (`HOS_INPUT_SCRIPT` and `HOS_INPUT_LIVE`) is applied before the window-focus check. A log saying
 the game window is not in front does not mean those presses were discarded. `HOS_HEADLESS` and
 `HOS_WINDOW_NOACTIVATE` change window creation, not this input routing. The game must still reach a state that reads

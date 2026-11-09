@@ -110,7 +110,19 @@ class ChildExitTests(unittest.TestCase):
         status, output, forwarded = self.run_child(body)
         self.assertEqual(status, 1)
         self.assertEqual(forwarded, ["translation began"])
-        self.assertEqual(output, "translation began\n@@error child.py stopped (signal 15): translation began\n")
+        self.assertEqual(output, "translation began\n@@error child.py stopped (signal 15): %s\n" % make_game.killed_reason())
+
+    @unittest.skipUnless(os.name == "posix", "POSIX reports a signal as a negative child return code")
+    def test_a_killed_step_is_not_named_by_its_workers_broken_pipes(self):
+        # (issues 768, 807: the system stopped lift.py, and its emit processes then failed on their result pipe)
+        body = ('import os, signal\nprint("chunks: writing", flush=True)\n'
+                'print("BrokenPipeError: [Errno 32] Broken pipe", flush=True)\nos.kill(os.getpid(), signal.SIGKILL)\n')
+        status, output, forwarded = self.run_child(body)
+        self.assertEqual(status, 1)
+        reason = output.splitlines()[-1]
+        self.assertTrue(reason.startswith("@@error child.py stopped (signal 9): the system stopped it, most likely because the PC "
+                                          "ran out of memory"), reason)
+        self.assertNotIn("BrokenPipe", reason)
 
     @unittest.skipUnless(os.name == "nt", "Windows returns native process status values")
     def test_windows_native_status_is_not_a_signal(self):
