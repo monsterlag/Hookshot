@@ -82,8 +82,8 @@ int main() {
 class ProgramCacheReaderTests(unittest.TestCase):
     def test_source_uses_bounds(self):
         source = SOURCE.read_text(encoding="utf-8")
-        load = block(source, "void program_cache_load(")
-        self.assertIn("Reader r{data.data(), data.data() + data.size()}", load)
+        load = block(source, "void program_cache_read(")
+        self.assertIn("Reader r{data.data() + 16, data.data() + data.size()}", load)
         self.assertIn("r.bad", load)
         self.assertIn("r.count(", block(source, "void get_info("))
 

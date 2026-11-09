@@ -319,7 +319,7 @@ class Builder(tk.Tk):
             return
         button.configure(text={"update-game": "Update", "up-to-date": "Play", "update-builder": "Update builder",
                                 "build": "Build"}[self.mode])
-        target = self.latest or self.tools
+        target = linux_update.update_target(self.latest, self.tools)
         if self.mode == "update-game":
             self.status.set("Hookshot %s is available. Your game is %s. Update downloads only what changed, then compiles what changed."
                             % (target, game))
@@ -336,7 +336,7 @@ class Builder(tk.Tk):
         if not self.launch_folder or not hasattr(self, "launch_status"):
             return
         game, kept = linux_update.game_version(self.launch_folder)
-        target = self.latest or self.tools
+        target = linux_update.update_target(self.latest, self.tools)
         show = False
         if target and game and game != target and kept:
             self.launch_status.set("Update available: %s" % target)
@@ -375,8 +375,10 @@ class Builder(tk.Tk):
             self.update_folder = folder
         self.show_progress("Updating your game" if self.update_folder else "Updating Hookshot Builder")
         folder = self.update_folder
-        # (a game older than this builder is built again with it: nothing to download, and GitHub need not answer)
-        fetched = self.fetched or bool(folder and self.tools and (self.update_tag or self.latest or self.tools) == self.tools)
+        # (a game older than this builder is built again with it: nothing to download, and GitHub need not answer. So is one
+        # from a builder that is not an older release, e.g. from the Actions tab: issue 902)
+        target = self.update_tag or linux_update.update_target(self.latest, self.tools)
+        fetched = self.fetched or bool(folder and self.tools and target == self.tools)
 
         def run():
             try:

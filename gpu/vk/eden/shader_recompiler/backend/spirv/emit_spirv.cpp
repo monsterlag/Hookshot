@@ -263,6 +263,12 @@ spv::ExecutionMode ExecutionMode(TessSpacing spacing) {
 
 void DefineEntryPoint(const IR::Program& program, EmitContext& ctx, Id main) {
     const std::span interfaces(ctx.interfaces.data(), ctx.interfaces.size());
+    if (ctx.mesh_fallback && (program.stage == Stage::Task || program.stage == Stage::Mesh)) {
+        // (hookshot, issue 640: on a GPU without mesh shaders, a task or mesh program is a compute shader)
+        ctx.AddExecutionMode(main, spv::ExecutionMode::LocalSize, program.workgroup_size[0], 1U, 1U);
+        ctx.AddEntryPoint(spv::ExecutionModel::GLCompute, main, "main", interfaces);
+        return;
+    }
     spv::ExecutionModel execution_model{};
     switch (program.stage) {
     case Stage::Compute: {
@@ -655,7 +661,17 @@ void PatchMeshInstructions(std::vector<u32>& code, const EmitContext& ctx) {
 std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings) {
     EmitContext ctx{profile, runtime_info, program, bindings};
     if (program.info.uses_cooperative_matrix && mma_software) DefineSoftwareMatrixFunction(ctx);
-    const Id main{DefineMain(ctx, program)};
+    Id main{};
+    if (runtime_info.mesh_fallback_vertex) {   // (hookshot: the fallback's generated vertex stage, which reads the records)
+        const Id void_function{ctx.TypeFunction(ctx.void_id)};
+        main = ctx.OpFunction(ctx.void_id, spv::FunctionControlMask::MaskNone, void_function);
+        ctx.AddLabel();
+        EmitMeshFallbackVertexBody(ctx);
+        ctx.OpReturn();
+        ctx.OpFunctionEnd();
+    } else {
+        main = DefineMain(ctx, program);
+    }
     DefineEntryPoint(program, ctx, main);
     if (profile.support_float_controls) {
         ctx.AddExtension("SPV_KHR_float_controls");

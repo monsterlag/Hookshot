@@ -192,6 +192,7 @@ static float text_scale(const char *env, int menu) {
     const int v = env && *env ? atoi(env) : menu;
     return v == 1 ? 2.0f : v == 2 ? 4.0f : v >= 3 ? 1e6f : 1.0f;
 }
+volatile uint64_t hos_res_module = 0;   /* (f_831f3200's object, whose +0xe5c is the 3D's scale: nx2/oot_patches.py) */
 static void realtime_step(int64_t now) {
     int rx_option(int id, int otherwise);
     /* (Resolution 100% from the start: the fixed path skipped the dynamic block from the first frame, its fields stayed
@@ -203,10 +204,11 @@ static void realtime_step(int64_t now) {
         if (!looked) looked = 1, env = getenv("HOS_TEXT_SPEED");
         hos_text_scale = text_scale(env, rx_option(5, 0));
     }
-    {   /* (the Insert menu's Resolution: the fixed path's scale, live; HOS_RES_SCALE below stays over it) */
-        const int percent = rx_option(3, 0);
-        if (percent > 0 && !getenv("HOS_RES_SCALE")) {
-            const float v = percent / 100.0f;
+    {   /* (the Insert menu's Resolution: the fixed path's scale in 1/10000, live; HOS_RES_SCALE
+           below stays over it) */
+        const int scale = rx_option(3, 0);
+        if (scale > 0 && !getenv("HOS_RES_SCALE")) {
+            const float v = scale / 10000.0f;
             memcpy((void *)&hos_fixed_scale_bits, &v, 4);
         }
     }
@@ -215,6 +217,20 @@ static void realtime_step(int64_t now) {
         if (!read_scale) {
             read_scale = 1;
             if (getenv("HOS_RES_SCALE")) { float v = (float)atof(getenv("HOS_RES_SCALE")); memcpy((void *)&hos_fixed_scale_bits, &v, 4); }
+        }
+    }
+    {   /* HOS_RES_LOG=1: the 3D's scale every 300 presents. +0xe20: flags (bit 3: 0.75, bit 4: 0.5 in place of the scale),
+           +0xe2c bit 3: recompute asked, +0xe50/+0xe54/+0xe58: the sizes the scale is taken against, +0xe5c: the scale */
+        static int on = -1;
+        static long long n;
+        if (on < 0) on = getenv("HOS_RES_LOG") != NULL;
+        const uint64_t m = hos_res_module;
+        if (on && m && !(n++ % 300)) {
+            float f[4], s;
+            memcpy(f, GP(m + 0xe50), sizeof f);
+            memcpy(&s, (const void *)&hos_fixed_scale_bits, 4);
+            hos_log("vi: res: fixed %d (scale %.3f), +0xe20 %llx, +0xe2c %x, +0xe50 %.0f %.0f %.0f, 3D scale %.3f", hos_fixed_resolution, s,
+                    (unsigned long long)*(uint64_t *)GP(m + 0xe20), *(uint32_t *)GP(m + 0xe2c), f[0], f[1], f[2], f[3]);
         }
     }
     const uint64_t mod = hos_gfx_module;

@@ -555,7 +555,8 @@ def compile_one(job):
             GATE.leave(src)
     r = subprocess.CompletedProcess(p.args, p.returncode, out, err)
     if r.returncode:
-        return src, time.time() - t, r.stderr[-4000:]
+        failure = r.stderr or r.stdout or "Compiler exited with status %d without diagnostics." % r.returncode
+        return src, time.time() - t, failure[-4000:]
     open(stamp, "w").write(key)
     cache_put(obj, key)
     return src, time.time() - t, None
@@ -695,8 +696,8 @@ def main():
         for f in sorted(translator) + [os.path.join(vk, n) for n in ("vk_shader.cpp", "vk_bank.cpp", "vk_state.h", "vk_api.h")]:
             with open(f, "rb") as src:
                 stamp.update(os.path.relpath(f, vk).replace("\\", "/").encode() + src.read().replace(bytes((13, 10)), bytes((10,))))
+        shader_stamp = "-DHOOKSHOT_SHADER_STAMP=0x%sull" % stamp.hexdigest()[:16]
         vflags = target() + CPU + (["-fPIC", "-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + [   # (hookshot: the replay is the frame's limit now)
-            "-DHOOKSHOT_SHADER_STAMP=0x%sull" % stamp.hexdigest()[:16],
             # (what the code takes for granted, which newer C++ libraries bring in by themselves and older ones do not: issue 48)
             "-include", "algorithm", "-include", "cstdio", "-include", "cstdlib", "-include", "cstring", "-include", "functional",
             "-include", "string", "-include", "vector",
@@ -721,7 +722,8 @@ def main():
             name = os.path.relpath(src, vk).replace(os.sep, "_")[:-4]
             lib = os.path.relpath(src, vk).split(os.sep)[0] in ("eden", "sirit")
             vk_jobs.append((cxx, src, os.path.join(obj_dir, "vk_" + name + ".o"),
-                            vflags + ([stamp_def] if os.path.basename(src) == "vk_menu.cpp" else []),
+                            vflags + ([shader_stamp] if os.path.basename(src) == "vk_shader.cpp" else []) +
+                            ([stamp_def] if os.path.basename(src) == "vk_menu.cpp" else []),
                             vk_lib_deps if lib else vdeps))
         if LINUX:   # (its own copy of the Win32 calls on POSIX, and the bit of GDI the Insert menu draws text with)
             cflags = target() + CPU + ["-fPIC", "-O2", "-g0", "-Wno-everything", "-D_GNU_SOURCE", "-I" + POSIX,

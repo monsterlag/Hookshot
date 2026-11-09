@@ -98,6 +98,15 @@ struct RuntimeInfo {
     bool force_early_z{};
     /// (hookshot) a mesh stage with no task stage before it: its workgroups start at the draw's first, as a task stage's do
     bool mesh_without_task{};
+    /// (hookshot) a GPU without VK_EXT_mesh_shader: task and mesh programs are compute shaders that write their stage
+    /// buffer outputs to storage buffers, and a generated vertex stage reads those records back.
+    bool mesh_fallback{};
+    /// (hookshot) the generated vertex stage of that fallback: it reads a record per position and writes the stage's outputs
+    bool mesh_fallback_vertex{};
+    /// (hookshot) a mesh program with a task program before it: the task's count in its payload bounds the mesh workgroups
+    bool mesh_fallback_task{};
+    /// (hookshot) the fallback's record slots: mesh workgroups past this one write nothing
+    u32 mesh_fallback_capacity{};
 
     TessPrimitive tess_primitive{};
     TessSpacing tess_spacing{};

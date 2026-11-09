@@ -2,11 +2,13 @@
 
     python -I -B tests/test_changelog.py
 """
+import importlib.util
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, "scripts", "changelog.py")
@@ -93,6 +95,62 @@ def main():
         with open(os.path.join(root, "changelog.txt"), encoding="utf-8") as f:
             text = f.read()
         assert "Version: 0.2.1\nDate: 08. 11. 2026\n  Changes:\n    - Release 0.2.1.\n" in text
+
+        # Errors while generating an entry must not truncate the previous changelog.
+        changelog_path = os.path.join(root, "changelog.txt")
+        with open(changelog_path, "rb") as f:
+            before = f.read()
+        for args, diagnostic in ((["0.2.2", "missing-release-tag"], b"git log"),
+                                 (["0.2.2", "v0.2.0", "--date", "not-a-date"], b"Invalid isoformat")):
+            r = subprocess.run([sys.executable, "-I", "-B", script] + args, capture_output=True)
+            assert r.returncode != 0 and diagnostic in r.stderr, r.stderr
+            with open(changelog_path, "rb") as f:
+                assert f.read() == before, "a failed entry must preserve the old bytes"
+
+        # Replacement failures also preserve the destination and clean up the temporary file.
+        spec = importlib.util.spec_from_file_location("changelog_under_test", script)
+        changelog = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(changelog)
+        files_before = set(os.listdir(root))
+        mode_before = os.stat(changelog_path).st_mode
+        real_temporary_file = changelog.tempfile.NamedTemporaryFile
+
+        def broken_temporary_file(*args, **kwargs):
+            f = real_temporary_file(*args, **kwargs)
+            real_write = f.write
+
+            def interrupted_write(content):
+                real_write(content[:16])
+                raise OSError("write failed")
+
+            f.write = interrupted_write
+            return f
+
+        with mock.patch.object(changelog.tempfile, "NamedTemporaryFile", side_effect=broken_temporary_file):
+            try:
+                changelog.write("0.2.2", "v0.2.0", "2026-11-08")
+            except OSError as error:
+                assert str(error) == "write failed"
+            else:
+                raise AssertionError("the write failure must reach the caller")
+        with open(changelog_path, "rb") as f:
+            assert f.read() == before
+        assert set(os.listdir(root)) == files_before, "no temporary file after an interrupted write"
+        with mock.patch.object(changelog.os, "replace", side_effect=OSError("replacement failed")):
+            try:
+                changelog.write("0.2.2", "v0.2.0", "2026-11-08")
+            except OSError as error:
+                assert str(error) == "replacement failed"
+            else:
+                raise AssertionError("the replacement failure must reach the caller")
+        with open(changelog_path, "rb") as f:
+            assert f.read() == before
+        assert set(os.listdir(root)) == files_before, "no temporary file after a failed replacement"
+        changelog.write("0.2.2", "v0.2.0", "2026-11-08")
+        with open(changelog_path, "rb") as f:
+            assert f.read().endswith(before)
+        assert os.stat(changelog_path).st_mode == mode_before, "keep the changelog's permissions"
+        assert set(os.listdir(root)) == files_before, "no temporary file after success"
 
         # a version that is not semantic is refused
         r = subprocess.run([sys.executable, "-I", script, "v9"], capture_output=True)

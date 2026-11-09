@@ -55,6 +55,7 @@ FIXTURE = r'''
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -63,8 +64,12 @@ struct DiskRecord { unsigned kind; };
 std::unordered_map<uint64_t, std::vector<DiskRecord>> disk_records;
 std::unordered_map<uint64_t, std::vector<std::unique_ptr<Program>>> programs;
 std::mutex disk_mu, shader_mu;
+bool disk_on = true;
+std::string disk_path;
+FILE* disk_in = nullptr;
 void disk_init() {}
-void program_cache_load(uint64_t, std::vector<std::unique_ptr<Program>>&) {}
+void program_cache_read(FILE*, std::mutex*, uint64_t, const std::vector<DiskRecord>&,
+                        std::vector<std::unique_ptr<Program>>&) {}
 struct Properties { uint32_t vendorID = 0x8086, deviceID = 7, driverVersion = 9; uint8_t pipelineCacheUUID[16]{}; };
 struct Device { Properties props; } dev;
 uint64_t stamp = 42;

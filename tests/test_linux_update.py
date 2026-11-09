@@ -48,6 +48,32 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(linux_update.choose_mode(None, "v2", "v2", False, False), "build")
         self.assertEqual(linux_update.choose_mode("v2", "v2", "v2", True, True), "build")
 
+    def test_a_build_that_is_not_an_older_release_is_not_made_to_update(self):
+        # (issue 902) an AppImage from the Actions tab is git describe's version, after the latest release: it builds
+        ci = "v2.0.5-3-g1a2b3c4"
+        self.assertEqual(linux_update.choose_mode(None, ci, "v2.0.5", False, False), "build")
+        self.assertEqual(linux_update.choose_mode(None, "1a2b3c4", "v2.0.5", False, False), "build")
+        self.assertEqual(linux_update.choose_mode(None, "dev", "v2.0.5", False, False), "build")
+        self.assertEqual(linux_update.choose_mode(None, "v2.0.6", "v2.0.5", False, False), "build")
+        self.assertEqual(linux_update.choose_mode(None, "v2.1.0-rc.1", "v2.0.5", False, False), "build")
+        # (its game is played, not taken back to the release; an older game is built again with this builder)
+        self.assertEqual(linux_update.choose_mode(ci, ci, "v2.0.5", False, True), "up-to-date")
+        self.assertEqual(linux_update.choose_mode("v2.0.4", ci, "v2.0.5", False, True), "update-game")
+        self.assertEqual(linux_update.update_target("v2.0.5", ci), ci)
+        # (a game the release built is older than this Actions builder: its Update builds it again with the builder running,
+        # nothing downloaded, as for any older game)
+        self.assertEqual(linux_update.choose_mode("v2.0.5", ci, "v2.0.5", False, True), "update-game")
+        # an older release still gets the newer one
+        self.assertEqual(linux_update.choose_mode(None, "v2.0.4", "v2.0.5", False, False), "update-builder")
+        self.assertEqual(linux_update.choose_mode(None, "v2.1.0-rc.1", "v2.1.0", False, False), "update-builder")
+        self.assertEqual(linux_update.choose_mode(None, "v2.0.10", "v2.0.9", False, False), "build")
+        self.assertEqual(linux_update.choose_mode("v2.0.4", "v2.0.4", "v2.0.5", False, True), "update-game")
+        self.assertEqual(linux_update.update_target("v2.0.5", "v2.0.4"), "v2.0.5")
+        # a build from the Actions tab made after an older release is offered the newer one
+        self.assertEqual(linux_update.choose_mode(None, "v2.0.4-3-g1a2b3c4", "v2.0.5", False, False), "update-builder")
+        self.assertEqual(linux_update.choose_mode(None, "v2.0.5-3-g1a2b3c4-dirty", "v2.0.5", False, False), "build")
+        self.assertEqual(linux_update.choose_mode(None, "v2.1.0-rc.1-2-gabc1234", "v2.1.0", False, False), "update-builder")
+
     def test_a_changed_part_is_downloaded_and_the_rest_are_kept(self):
         with tempfile.TemporaryDirectory(prefix="hookshot-parts-") as tmp:
             root = Path(tmp)

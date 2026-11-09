@@ -301,6 +301,8 @@ static void live_input(void) {
                 if (!strncmp(line, "!rdoc", 5)) rx_request_rdoc_capture(atoi(line + 5));
                 void rx_flash_dark_arm(void);   /* gpu/render/rx_core.cpp: arms RX_FLASH_DARK_DUMP (RX_FLASH_DARK_AFTER=-1) */
                 if (!strncmp(line, "!flasharm", 9)) rx_flash_dark_arm();
+                extern volatile int hos_oot_live_action;   /* host/hos_main.c: "!cheat <action>", as the Cheats page sends */
+                if (!strncmp(line, "!cheat ", 7)) __atomic_store_n(&hos_oot_live_action, atoi(line + 7), __ATOMIC_RELAXED);
                 hos_log("hid: live command at %.1f s: %.*s", at / 1000.0, (int)(n > 1 ? n - 1 : 0), line);
                 continue;
             }
@@ -608,6 +610,50 @@ static int bound_down(int i, int mouse) {
     return 0;
 }
 
+static uint64_t flight_input;
+static uint64_t free_camera_axes;
+static int free_camera_height;
+
+uint64_t hos_flight_input(void) {
+    return __atomic_load_n(&flight_input, __ATOMIC_RELAXED);
+}
+
+uint64_t hos_free_camera_input(int *height) {
+    *height = __atomic_load_n(&free_camera_height, __ATOMIC_RELAXED);
+    return __atomic_load_n(&free_camera_axes, __ATOMIC_RELAXED);
+}
+
+static int flight_jump_shortcut(uint64_t *buttons, int mode, int menu_open, int free_camera) {
+    int hos_oot_flight_shortcut_ready(void);
+    static int64_t first_press;
+    static int held, consume_jump;
+    const uint64_t jump = 1ULL << B_B;
+    const int down = !!(*buttons & jump);
+    if (mode < 0 || menu_open || free_camera || !hos_oot_flight_shortcut_ready() || !game_in_front()) {
+        first_press = 0;
+        held = 1;
+        consume_jump = 0;
+        return mode > 0;
+    }
+    if (down && !held) {
+        const int64_t now = hos_now_ns();
+        if (first_press && now - first_press <= 300000000) {
+            mode = !mode;
+            rx_option_set(HOS_OPT_CHEAT_FLIGHT, mode);
+            mode = rx_option(HOS_OPT_CHEAT_FLIGHT, -1);
+            first_press = 0;
+            consume_jump = mode == 0;
+        } else {
+            first_press = now;
+        }
+    } else if (!down) {
+        consume_jump = 0;
+    }
+    held = down;
+    if (consume_jump) *buttons &= ~jump;
+    return mode > 0;
+}
+
 static void read_input(uint64_t *buttons, int32_t stick[4]) {
     *buttons = 0;
     memset(stick, 0, 4 * sizeof *stick);
@@ -713,7 +759,31 @@ static void npad_states(Ctx *c) {
                     (unsigned long long)c->x[30]);
         }
     }
-    if (connected) read_input(&buttons, stick);
+    if (connected) {
+        read_input(&buttons, stick);
+        uint64_t axes = 0;
+        uint64_t flight = 0;
+        int height = 0;
+        const int menu_open = rx_option(1, 0);
+        const int free_camera = rx_option(HOS_OPT_CHEAT_CAMERA, 0);
+        const int flying = flight_jump_shortcut(&buttons, rx_option(HOS_OPT_CHEAT_FLIGHT, -1), menu_open, free_camera);
+        if (free_camera && !menu_open) {
+            for (int i = 0; i < 4; i++) axes |= (uint64_t)(uint16_t)stick[i] << (16 * i);
+            height = (int)(buttons >> B_R & 1) - (int)(buttons >> B_L & 1);
+            memset(stick, 0, sizeof stick);
+            buttons &= ~((1ULL << B_L) | (1ULL << B_R));
+        } else if (flying && !menu_open) {
+            const uint64_t climb = (1ULL << B_B) | (1ULL << B_R);
+            const int vertical = !!(buttons & climb) - (int)(buttons >> B_L & 1);
+            flight = (uint16_t)stick[0] | (uint64_t)(uint16_t)stick[1] << 16 |
+                     (uint64_t)(uint16_t)vertical << 32;
+            stick[0] = stick[1] = 0;
+            buttons &= ~(climb | (1ULL << B_L));
+        }
+        __atomic_store_n(&flight_input, flight, __ATOMIC_RELAXED);
+        __atomic_store_n(&free_camera_axes, axes, __ATOMIC_RELAXED);
+        __atomic_store_n(&free_camera_height, height, __ATOMIC_RELAXED);
+    }
     uint64_t hos_title_input(uint64_t buttons);   /* totk_title.c: the title menu's credits entries */
     if (connected) buttons = hos_title_input(buttons);
     uint64_t hos_frame_step_buttons(uint64_t buttons);   /* nn_vi.c: the frame step of the wheel and quick menus */
