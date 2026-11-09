@@ -61,6 +61,7 @@ def main():
     api = (ROOT / "gpu/vk/vk_api.h").read_text(encoding="utf-8")
     constants = block(hid, "enum { B_A") + ";\n" + block(api, "enum { HOS_SW_A") + ";\n"
     constants += block(api, "enum { HOS_KEY_MOVE_UP") + ";\n"   # (the keys-only controls)
+    constants += block(api, "enum { HOS_OPT_CHEAT_HEARTS") + ";\n"
     for name in ("STATE_SIZE", "NPAD_NO1", "ATTR_CONNECTED"):
         matches = re.findall(r"^#define " + name + r"\s+[^\n]+", hid, re.M)
         assert len(matches) == 1, name
@@ -68,13 +69,19 @@ def main():
     start = hid.index("typedef struct { int64_t start_ms, end_ms;")
     script = block(hid, "static void scripted_input(")
     end = hid.index(script) + len(script)
-    actual = "\n".join((block(hid, "static int key("), block(hid, "static int kmap_down("),
+    cheat_state = re.search(r"^static uint64_t flight_input;\nstatic uint64_t free_camera_axes;\nstatic int free_camera_height;", hid, re.M).group(0)
+    cheat_spies = """
+volatile int hos_oot_live_action;
+int hos_oot_flight_shortcut_ready(void) { CHECK(!"unexpected cheat readiness query"); return 0; }
+void rx_option_set(int id, int value) { (void)id; (void)value; CHECK(!"unexpected cheat option change"); }
+"""
+    actual = "\n".join((cheat_state, cheat_spies, block(hid, "static int key("), block(hid, "static int kmap_down("),
         block(hid, "static int game_in_front("), hid[start:end], block(hid, "static void stick_max("),
         block(hid, "static int pads_in_background("),
         # (the bound keys' helpers read_input calls: a mouse button counts only while the mouse is captured)
         block(hid, "static int mouse_vk_slot("), re.search(r"^static int mouse_armed\[5\];", hid, re.M).group(0),
         block(hid, "static void mouse_buttons_arm("), block(hid, "static int bound_down("),
-        read, block(hid, "static void npad_states(")))
+        block(hid, "static int flight_jump_shortcut("), read, block(hid, "static void npad_states(")))
     glue = (ROOT / "host/mkw_glue.c").read_text(encoding="utf-8")
     actual += "\n" + "\n".join(block(glue, "uint64_t " + name + "(")
                                   for name in ("hos_title_input", "hos_frame_step_buttons"))

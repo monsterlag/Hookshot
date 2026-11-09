@@ -187,9 +187,12 @@ void queue_flush_for(int why) {
     flush_reason = why;
     queue_flush_locked();
 }
-// (RX_VK_BATCH_POLL_US=<us>: a progress poll sends held submits only once the oldest has waited that long; 0: always)
+// (RX_VK_BATCH_POLL_US=<us>: a progress poll sends held submits only once the oldest has waited that long; 0: always.
+// Default 2000: the game polls many times a frame, and each poll that flushed was a whole command submission, the cost
+// batching is there to avoid. RX 7800 XT, RADV, Kokiri: 525 -> 67 poll flushes per 120 presents, 38 -> 42.5 fps; issues
+// 413, 528)
 void queue_flush_poll() {
-    static const int64_t us = getenv("RX_VK_BATCH_POLL_US") ? atoll(getenv("RX_VK_BATCH_POLL_US")) : 0;
+    static const int64_t us = getenv("RX_VK_BATCH_POLL_US") ? atoll(getenv("RX_VK_BATCH_POLL_US")) : 2000;
     std::lock_guard lk(dev.present_mu);
     if (pend.cbs.empty()) return;
     if (us > 0 && std::chrono::steady_clock::now() - pend_since < std::chrono::microseconds(us)) return;
@@ -2213,7 +2216,9 @@ VmaAllocation off_alloc = nullptr;
 VkBuffer shot_bufs[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
 VmaAllocation shot_allocs[2] = {nullptr, nullptr};
 void* shot_maps[2] = {nullptr, nullptr};
-constexpr uint32_t kShotW = 1280, kShotH = 720;
+// (RX_VK_SHOT_W / RX_VK_SHOT_H: another size, e.g. the game's output size for its own pixels)
+const uint32_t kShotW = getenv("RX_VK_SHOT_W") ? (uint32_t)atoi(getenv("RX_VK_SHOT_W")) : 1280,
+               kShotH = getenv("RX_VK_SHOT_H") ? (uint32_t)atoi(getenv("RX_VK_SHOT_H")) : 720;
 VkImage shot_image = VK_NULL_HANDLE;
 VkBuffer made_buf = VK_NULL_HANDLE;   // (RX_VK_SHOT_MADE: a made frame's readback)
 VmaAllocation made_buf_alloc = nullptr;
@@ -3539,8 +3544,12 @@ void fill_replay_table(MkwVkRenderer& t) {
     t.nvn_present = present;
     t.nvn_register_texture = register_texture_queued;
     t.nvn_event_signal = event_signal_queued;
-    t.option = [](int id) -> int {
-        return id == 0 ? opts.realtime : id == 1 ? menu_is_open() : id == 2 ? opts.resolution == 0 : id == 3 ? (opts.resolution == 1 ? 100 : opts.resolution == 2 ? 75 : opts.resolution == 3 ? 67 : opts.resolution == 4 ? 50 : 0) : id == 4 ? opts.pad_background : id == 5 ? opts.text_speed : id == 6 ? opts.mouse_native :
+    t.option = [](int id) -> int {   // (3: the fixed path's scale in 1/10000, vk_menu.cpp)
+        if (id == HOS_OPT_CHEAT_HEARTS) return menu_heart_protection();
+        if (id == HOS_OPT_CHEAT_FLIGHT) return menu_player_flight();
+        if (id == HOS_OPT_CHEAT_ACTION) return menu_take_cheat_action();
+        if (id == HOS_OPT_CHEAT_CAMERA) return menu_free_camera();
+        return id == 0 ? opts.realtime : id == 1 ? menu_is_open() : id == 2 ? resolution_auto() : id == 3 ? resolution_scale() : id == 4 ? opts.pad_background : id == 5 ? opts.text_speed : id == 6 ? opts.mouse_native :
                id == 7 ? opts.mouse_sens : id == 8 ? opts.mouse_invert : id == 16 ? opts.invert_cam_x : id == 17 ? opts.invert_cam_y : 0;
     };
     t.option_set = menu_option_set;

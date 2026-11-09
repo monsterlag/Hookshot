@@ -2,7 +2,9 @@
 import argparse
 import ast
 import collections
+import concurrent.futures
 import multiprocessing
+import os
 from pathlib import Path
 import queue
 import sys
@@ -42,6 +44,17 @@ class Payload(list):
     pass
 
 
+class StoppedEmitter:
+    def __init__(self, counts):
+        self.parent_pid, self.counts = os.getpid(), counts
+
+    def __call__(self, e, texts):
+        if e == 4 and os.getpid() != self.parent_pid:
+            os._exit(17)   # Authored worker death only; serial fallback in the parent must finish this same batch.
+        self.counts["emitted"] += 1
+        return texts[e], {"ref_%d" % e}
+
+
 class Result:
     def __init__(self, function, args, pool):
         try:
@@ -51,13 +64,13 @@ class Result:
         except Exception as error:
             self.value, self.error = None, error
 
-    def get(self):
+    def result(self):
         if self.error is not None:
             raise self.error
         return self.value
 
 
-class RecordingPool:
+class RecordingExecutor:
     """Record actual production submissions; finish tiny tasks immediately, like fast later workers."""
     def __init__(self):
         self.submitted, self.payloads, self.closed, self.max_live = [], [], False, 0
@@ -68,17 +81,17 @@ class RecordingPool:
     def __exit__(self, *error):
         self.closed = True
 
-    def apply_async(self, function, args):
+    def submit(self, function, *args):
         self.submitted.append(tuple(args[0]))
         result = Result(function, args, self)
         self.max_live = max(self.max_live, sum(ref() is not None for ref in self.payloads))
         return result
 
-    def imap(self, function, batches):
-        # The old imap feeder may submit/finish every later task while its first ordered result is unavailable.
-        results = [self.apply_async(function, (batch,)) for batch in batches]
+    def map(self, function, batches):
+        # Current main eagerly submits every run before yielding the first ordered result.
+        results = [self.submit(function, batch) for batch in batches]
         for result in results:
-            yield result.get()
+            yield result.result()
 
 
 class ProbeEmitter:
@@ -101,20 +114,22 @@ def fork_probe(source, gate, messages):
     assert threading.active_count() == 1
     module = load_emit(source)
     context = multiprocessing.get_context("fork")
+    real_executor = concurrent.futures.ProcessPoolExecutor
 
     class ObservedResult:
         def __init__(self, result, pool):
-            self.result, self.pool = result, pool
+            self.future, self.pool = result, pool
 
-        def get(self):
+        def result(self):
             if not self.pool.noted:
                 self.pool.noted = True
                 messages.put(("window", self.pool.submitted))
-            return self.result.get()
+            return self.future.result()
 
-    class ObservedPool:
-        def __init__(self, jobs):
-            self.pool = context.Pool(jobs)   # no threads existed in this process before the fork
+    class ObservedExecutor:
+        def __init__(self, max_workers, mp_context):
+            assert threading.active_count() == 1
+            self.pool = real_executor(max_workers=max_workers, mp_context=mp_context)
             self.submitted, self.noted = 0, False
 
         def __enter__(self):
@@ -124,17 +139,17 @@ def fork_probe(source, gate, messages):
         def __exit__(self, *error):
             return self.pool.__exit__(*error)
 
-        def apply_async(self, function, args):
+        def submit(self, function, *args):
             self.submitted += 1
-            return ObservedResult(self.pool.apply_async(function, args), self)
+            return ObservedResult(self.pool.submit(function, *args), self)
 
-        def imap(self, function, batches):
-            return self.pool.imap(function, batches)
+        def map(self, function, batches):
+            return self.pool.map(function, batches)
 
     count = collections.Counter()
     texts = {e: "body_%d" % e for e in range(12)}
     try:
-        with mock.patch.object(module.multiprocessing, "get_context", return_value=types.SimpleNamespace(Pool=ObservedPool)):
+        with mock.patch.object(concurrent.futures, "ProcessPoolExecutor", ObservedExecutor):
             values, counter_order = [], []
             for value in module.parallel_emit(ProbeEmitter(gate, messages, count), list(texts), texts, [count], 2, run=1):
                 values.append(value)
@@ -151,11 +166,15 @@ class EmitBacklogTests(unittest.TestCase):
         self.texts = {e: "body_%d" % e for e in range(12)}
 
     def fake(self, fail=None, jobs=2, order=None):
-        pool = RecordingPool()
-        context = types.SimpleNamespace(Pool=lambda count: pool)
+        pool = RecordingExecutor()
+        context = object()
         patch = mock.patch.object(self.module.multiprocessing, "get_context", return_value=context)
         patch.start()
         self.addCleanup(patch.stop)
+        executor = mock.patch.object(concurrent.futures, "ProcessPoolExecutor",
+                                     side_effect=lambda **kwargs: pool)
+        executor.start()
+        self.addCleanup(executor.stop)
         made = self.module.parallel_emit(AuthoredEmitter(fail), list(self.texts) if order is None else order,
                                          self.texts, [], jobs, run=2)
         self.addCleanup(made.close)
@@ -198,6 +217,18 @@ class EmitBacklogTests(unittest.TestCase):
                 pool, made = self.fake(jobs=jobs, order=order)
                 self.assertEqual([v[0] for v in made], order)
                 self.assertEqual(pool.submitted, [])
+
+    @unittest.skipUnless("fork" in multiprocessing.get_all_start_methods(), "real fork cleanup runs on POSIX")
+    def test_broken_worker_falls_back_without_losing_or_doubling_results(self):
+        self.assertEqual(threading.active_count(), 1)
+        before = {p.pid for p in multiprocessing.active_children()}
+        counts = collections.Counter()
+        values = list(self.module.parallel_emit(StoppedEmitter(counts), list(self.texts), self.texts,
+                                                [counts], 2, run=2))
+        self.assertEqual(values, [(e, self.texts[e], {"ref_%d" % e}) for e in self.texts])
+        self.assertEqual(counts, {"emitted": 12})
+        self.assertIsNone(self.module._job)
+        self.assertEqual({p.pid for p in multiprocessing.active_children()}, before)
 
     @unittest.skipUnless("fork" in multiprocessing.get_all_start_methods(), "real fork cleanup runs on POSIX")
     def test_real_worker_exception_and_early_close_cleanup(self):

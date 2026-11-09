@@ -10,6 +10,7 @@ struct Options {
     int framegen = 0;     // made frames: 0 off, or 2, 3, 4 times the game's frames
     int pace = 0;         // frames shown on an even line (vk_framegen.cpp)
     int resolution = 0;   // the 3D's: 0 Auto (the game's dynamic resolution), else 100%, 75%, 67%, 50% of its full scale (nx2/oot_patches.py)
+    int output_res = 0;   // the game's whole frame, docked: 0 its 2048x1152, 1 2560x1440, 2 3840x2160; read once, at the start (host/nn_applet.c)
     int upscale = 0;      // to the window: 0 off (the plain copy to the window), 1 Catmull-Rom, 2 Lanczos
     int sharpness = 0;    // 0 to 100
     int realtime = 1;     // game time follows the clock (host/nn_vi.c); 0: per frame (slower frames, slower game)
@@ -41,7 +42,13 @@ void menu_init();             // (the options from the file, once)
 void menu_set_gpu_count(int count);
 void menu_tick();             // (each frame shown: the keys, while the game's window has the focus)
 bool menu_is_open();
+bool resolution_auto();       // (the game's dynamic resolution: Resolution Auto)
+int resolution_scale();       // (the fixed path's scale in 1/10000: the Resolution row's, as a twelfth of the output)
 void menu_option_set(int id, int value);   // (from the game's side: 7 the mouse's sensitivity, the - and = keys)
+int menu_heart_protection();
+int menu_player_flight();
+int menu_free_camera();
+int menu_take_cheat_action();
 void menu_note_frame(bool game_frame);   // (the frame rates the FPS counter shows)
 /// Over the window's image (TRANSFER_DST_OPTIMAL), w x h: the menu and the FPS counter. slot: the frame in flight, 0 to 2.
 void menu_record(VkCommandBuffer cmd, VkImage dst, int slot, uint32_t w, uint32_t h);

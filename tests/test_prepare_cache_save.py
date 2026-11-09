@@ -13,7 +13,7 @@ cpp=r"""
 #include <vector>
 using std::size_t;
 std::vector<int> calls;
-bool prepare_run(void(*)(size_t,size_t)){calls.push_back(1);return true;}
+bool prepare_run(void(*)(size_t,size_t),bool background=false){if(background)std::exit(3);calls.push_back(1);return true;}
 void predict_run(void(*)(size_t,size_t)){calls.push_back(5);}
 void precompile_run(void(*)(size_t,size_t)){calls.push_back(2);}
 void pipeline_cache_save(bool force){if(!force)std::exit(2);calls.push_back(3);}

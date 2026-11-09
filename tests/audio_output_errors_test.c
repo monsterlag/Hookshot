@@ -22,7 +22,9 @@ typedef struct { LPSTR lpData; unsigned dwBufferLength, dwFlags; } WAVEHDR;
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %s:%d: %s\n", scenario, __LINE__, #x); exit(1); } } while (0)
 
 static const char *scenario;
-static int prepare_calls, write_calls, accepted, unprepare_calls, open_calls, logs;
+static int prepare_calls, write_calls, accepted, unprepare_calls, open_calls, close_calls, reset_calls, logs;
+static unsigned last_device;
+static uint64_t now_ms;
 static int fail_prepare, fail_write, fail_unprepare, fail_open;
 static int queued[10];
 static WAVEHDR *known[10];
@@ -44,7 +46,8 @@ static int slot(WAVEHDR *h) {
 }
 static MMRESULT test_open(HWAVEOUT *out, unsigned device, const WAVEFORMATEX *f,
                           uintptr_t callback, uintptr_t instance, unsigned flags) {
-    (void)device; (void)callback; (void)instance; (void)flags;
+    (void)callback; (void)instance; (void)flags;
+    last_device = device;
     CHECK(f->nChannels == 2 && f->nSamplesPerSec == 48000 && f->wBitsPerSample == 16);
     open_calls++;
     if (fail_open) return 7;
@@ -79,11 +82,28 @@ static MMRESULT test_unprepare(HWAVEOUT out, WAVEHDR *h, unsigned size) {
     h->dwFlags &= ~WHDR_PREPARED;
     return 0;
 }
+static MMRESULT test_reset(HWAVEOUT out) {
+    (void)out;
+    reset_calls++;
+    for (int i = 0; i < 10; i++) if (queued[i]) {   /* (waveOutReset: every queued block marked done) */
+        queued[i] = 0;
+        known[i]->dwFlags = (known[i]->dwFlags & ~WHDR_INQUEUE) | WHDR_DONE;
+    }
+    return 0;
+}
+static MMRESULT test_close(HWAVEOUT out) { (void)out; close_calls++; return 0; }
+/* (the platform helpers nn_audio.c defines before its output section) */
+static unsigned au_device_count(void) { return 2; }
+static void au_device_name(unsigned device, char *out, size_t size) { snprintf(out, size, "test device %u", device); }
+static uint64_t au_ms(void) { return now_ms; }
+static void au_opened(HWAVEOUT w) { (void)w; }
 #define getenv test_getenv
 #define waveOutOpen test_open
 #define waveOutPrepareHeader test_prepare
 #define waveOutWrite test_write
 #define waveOutUnprepareHeader test_unprepare
+#define waveOutReset test_reset
+#define waveOutClose test_close
 #include "audio_output.inc"
 
 static void complete_all(void) {
@@ -109,12 +129,26 @@ int main(int argc, char **argv) {
     fail_open = !strcmp(scenario, "open");
     if (!strcmp(scenario, "bounded")) fail_prepare = -1;
     output_open();
-    CHECK(open_calls == 1);
     if (fail_open) {
+        CHECK(open_calls == 3);   /* (the default, then both devices; HOS_AUDIO_DEVICE unset) */
         CHECK(!wout);
         frames(40, 1);
-        CHECK(!prepare_calls && !write_calls && logs == 1);
+        CHECK(!prepare_calls && !write_calls && logs == 3);
         CHECK(strstr(last_log, "waveOutOpen") && strstr(last_log, "7"));
+    } else if (open_calls != 1 || last_device != WAVE_MAPPER || logs != 1 || !strstr(last_log, "default device")) {
+        CHECK(0);   /* (a working default is opened first, and named in the log) */
+    } else if ((logs = 0), !strcmp(scenario, "stall")) {
+        frames(20, 0);                   /* every block queued, none ever completes: the device takes nothing */
+        now_ms += 1000;
+        frames(1, 0);                    /* the stall noticed */
+        CHECK(open_calls == 1);
+        now_ms += 1600;
+        frames(1, 0);                    /* 1.6 s later: closed, the next candidate (device 0) opened */
+        CHECK(reset_calls == 1 && close_calls == 1 && open_calls == 2 && last_device == 0);
+        CHECK(strstr(last_log, "test device 0"));
+        const int before = accepted;
+        frames(4, 1);
+        CHECK(accepted == before + 2);   /* the new device takes blocks */
     } else if (fail_prepare > 0 || fail_write) {
         frames(40, 1);
         fprintf(stderr, "ring %s: accepted %d, prepare %d, write %d\n", scenario, accepted, prepare_calls, write_calls);

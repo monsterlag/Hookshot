@@ -237,7 +237,8 @@ dump, the runtime made game-neutral, the stage-1 tools checked on MKW's dump as 
   slower, narrow barriers no change, RX_VK_WAIT_GPU no help.
 - Tools: RX_VK_FRAMELOG + scripts/framelog.py (every frame shown), RX_VK_PROBE=2 (the passes at speed), RX_VK_SLOW_LOG, HOS_WATCH.
 - A release build (`RX_RELEASE=1` at build time) precompiles before the game starts; test builds do not unless RX_VK_PRECOMPILE=1.
-  hookshot_programs.bin, hookshot_pipelines.bin and mkw_vk_pipelines.bin go beside the executable.
+  hookshot_programs.bin (with hookshot_programs.idx, the list of its records), hookshot_pipelines.bin and mkw_vk_pipelines.bin go
+  beside the executable.
 
 ## 11. Findings, 2026-11-06, day
 

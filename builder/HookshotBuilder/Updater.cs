@@ -114,7 +114,14 @@ static class Updater
             w.DownloadFailed("The Hookshot tools were not found next to this app.");
             return;
         }
-        // (already the new release, or just downloaded: no second download, whatever its version file says)
+        // (just downloaded, but another release than asked for: the setup installed the release before it (GitHub's latest link lags
+        // right after a publish), and building here kept players on the old version while the builder said it updated)
+        if (fetched && tag != null && tools.Version != null && tools.Version != tag)
+        {
+            w.DownloadFailed($"The update installed {tools.Version}, not {tag}: GitHub's download links can lag right after a release. Try Update again in a few minutes.");
+            return;
+        }
+        // (already the new release, or just downloaded: no second download)
         if (fetched || (tag != null && tools.Version == tag))
         {
             w.UpdateBuild(tools, folder);

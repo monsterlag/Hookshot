@@ -19,8 +19,10 @@ import argparse
 import datetime
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CHANGELOG = os.path.join(ROOT, "changelog.txt")
@@ -108,8 +110,19 @@ def write(version, since=None, date=None):
     if "Version: %s" % version in old.splitlines():   # (a retried job must not add the version twice)
         print("changelog: %s is already in changelog.txt" % version)
         return
-    with open(CHANGELOG, "w", encoding="utf-8", newline="\n") as f:
-        f.write(entry(version, since, date) + old.lstrip("\n"))
+    content = entry(version, since, date) + old.lstrip("\n")
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n", delete=False,
+                                         dir=os.path.dirname(CHANGELOG), prefix=".changelog-", suffix=".tmp") as f:
+            temporary = f.name
+            f.write(content)
+        if os.path.exists(CHANGELOG):
+            shutil.copymode(CHANGELOG, temporary)
+        os.replace(temporary, CHANGELOG)
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def main():
