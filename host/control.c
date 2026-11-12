@@ -14,7 +14,8 @@
    (gpu/vk/vk_replay.cpp shot_ask), the Insert menu's settings through its own setter. The game never waits for the
    bridge: the controller's read takes one short lock that the bridge never holds over I/O.
 
-   Commands: status, press, stick, sequence, release, shot, wait, option_get, option_set, saves, teleport (OoT), subscribe,
+   Commands: status, press, stick, sequence, release, shot, wait, option_get, option_set, saves, teleport and age (OoT),
+   subscribe,
    unsubscribe, quit, and guest memory (mem_read, mem_read_many, mem_write) when HOS_CONTROL_MEM allows it.
    Inputs are timed in frames, from the first controller read after the request. The state (intro, menu, loading,
    play) is a guess from the draws a frame, as test scripts made it from the log: ~2 draws at the intro, 15-70 in menus,
@@ -318,7 +319,8 @@ typedef struct {
     int wait, from_changes; int64_t target; char state[16], map[80];
     int token; char path[1100];   /* P_SHOT (its result: G.shots), P_MEM */
     int mem_slot;   /* P_MEM */
-    int dest;       /* P_TELEPORT: the destination (token: the game's ticket) */
+    int dest;       /* P_TELEPORT: the destination (token: the game's ticket); -1 the age switch's */
+    int adult_to;   /* P_TELEPORT for the age switch: 1 to the adult, 0 to the child */
 } Pending;
 
 typedef struct {
@@ -1307,19 +1309,74 @@ static void cmd_teleport(int ci, const JDoc *d, int req, const char *id) {
     buf_puts(&b, ",\"sent\":null");
     reply_end(c, &b);
 }
-/* (pending_tick) what came of a teleport: sent, refused, replaced, or not taken in time (then cancelled) */
+/* ---- (OoT) the Debug tab's Switch age: Link's age flipped and the map reloaded in the other age, as the menu does it,
+   taken at the player's next update as a teleport is (the same tickets: a later teleport or age ask replaces one not taken
+   yet). to: "child" or "adult", none the other age (from oot_state's sample). The age asked for goes to the game, which
+   checks it when it takes it (the sample can be old): already that age, nothing is done and the reply says so. The reply
+   says whether it was sent (and the map it reloads), not needed, or refused (and why), unless "wait": false ---- */
+static void cmd_age(int ci, const JDoc *d, int req, const char *id) {
+    Conn *c = &G.conns[ci];
+    if (!G.game->age || !G.game->oot_state || !G.game->teleport_result)
+        return reply_error(c, id, "unavailable", "this game has no age switch");
+    int event = 0, loading = 0, child = 0;
+    if (!G.game->oot_state(&event, &loading, &child))
+        return reply_error(c, id, "unavailable", "Link's age is not known yet: a save is loaded in play first");
+    const JNode *to = j_get(d, req, "to");
+    int adult_to = child;   /* (none: the other age) */
+    if (to && to->type != J_NULL) {
+        if (to->type != J_STR || (strcmp(to->s, "child") && strcmp(to->s, "adult")))
+            return reply_error(c, id, "bad_request", "to: \"child\" or \"adult\" (none: the other age)");
+        adult_to = !strcmp(to->s, "adult");
+    }
+    Buf b = {0};
+    int bad = 0;
+    const int wait = bool_arg(d, req, "wait", 1);
+    const int64_t deadline = deadline_arg(d, req, 10, &bad);
+    if (bad) return reply_error(c, id, "bad_request", "timeout: seconds");
+    Pending *p = wait ? pending_new(ci, id, P_TELEPORT) : NULL;
+    if (wait && !p) return reply_error(c, id, "busy", "too many requests waiting");
+    const int ticket = G.game->age(adult_to);
+    if (ticket <= 0) {
+        if (p) p->used = 0;
+        return reply_error(c, id, "unavailable", "the game did not take the age switch");
+    }
+    ctl_log("control: age switch to the %s asked for", adult_to ? "adult" : "child");
+    if (p) {
+        p->token = ticket, p->dest = -1, p->adult_to = adult_to, p->deadline = deadline;
+        return;
+    }
+    reply_start(&b, id, 1);
+    buf_printf(&b, ",\"age\":\"%s\",\"sent\":null", adult_to ? "adult" : "child");
+    reply_end(c, &b);
+}
+
+/* (pending_tick) what came of a teleport or an age switch: sent, refused, replaced, or not taken in time (then cancelled) */
 static int teleport_done(Pending *p, Conn *c, int64_t now) {
     char why[128] = "", map[80] = "";
     int accepted = 0;
     const int r = G.game->teleport_result(p->token, why, sizeof why, map, sizeof map, &accepted);
     if (r == 0 && now < p->deadline) return 0;
+    const char *what = p->dest < 0 ? "age switch" : "teleport";
     if (r == 0) {
         if (G.game->teleport_cancel) G.game->teleport_cancel(p->token);
-        reply_error(c, p->id, "timeout", "the game did not take the teleport: it is taken at Link's next update, in play "
-                    "(not on the title, the file select, a pause menu or a load)");
-    } else if (r == -1) reply_error(c, p->id, "refused", "the game refused the teleport: %s", why[0] ? why : "no reason given");
-    else if (r == -2) reply_error(c, p->id, "cancelled", "a later teleport replaced it before the game took it");
-    else {
+        reply_error(c, p->id, "timeout", "the game did not take the %s: it is taken at Link's next update, in play "
+                    "(not on the title, the file select, a pause menu or a load)", what);
+    } else if (r == -1) reply_error(c, p->id, "refused", "the game refused the %s: %s", what, why[0] ? why : "no reason given");
+    else if (r == -2) reply_error(c, p->id, "cancelled", "a later teleport or age switch replaced it before the game took it");
+    else if (r == 2) {   /* (the age switch: Link was that age when the game took it, nothing done) */
+        Buf b = {0};
+        reply_start(&b, p->id, 1);
+        buf_printf(&b, ",\"age\":\"%s\",\"sent\":false", p->adult_to ? "adult" : "child");
+        reply_end(c, &b);
+    } else if (p->dest < 0) {
+        Buf b = {0};
+        reply_start(&b, p->id, 1);
+        buf_printf(&b, ",\"age\":\"%s\",\"sent\":true,\"map\":", p->adult_to ? "adult" : "child");
+        if (map[0]) buf_str(&b, map);
+        else buf_puts(&b, "null");
+        buf_printf(&b, ",\"accepted\":%s", accepted ? "true" : "false");
+        reply_end(c, &b);
+    } else {
         const char *child = NULL, *adult = NULL;
         G.game->destination(p->dest, &child, &adult);
         Buf b = {0};
@@ -1730,6 +1787,7 @@ static void request(int ci, const char *line, size_t len) {
     else if (!strcmp(cmd, "release")) cmd_release(ci, &d, req, id);
     else if (!strcmp(cmd, "saves")) cmd_saves(ci, id);
     else if (!strcmp(cmd, "teleport")) cmd_teleport(ci, &d, req, id);
+    else if (!strcmp(cmd, "age")) cmd_age(ci, &d, req, id);
     else if (!strcmp(cmd, "shot")) cmd_shot(ci, &d, req, id);
     else if (!strcmp(cmd, "wait")) cmd_wait(ci, &d, req, id);
     else if (!strcmp(cmd, "option_get")) cmd_option_get(ci, &d, req, id);
@@ -2261,6 +2319,7 @@ int hos_oot_destination(int index, const char **child, const char **adult);
 int hos_oot_teleport_ask(int index);
 int hos_oot_teleport_result(int ticket, char *why, size_t why_cap, char *map, size_t map_cap, int *accepted);
 void hos_oot_teleport_cancel(int ticket);
+int hos_oot_age_ask(int adult);
 int hos_oot_state(int *event, int *loading, int *child);
 static HosControlGame game = {
     .frame = game_frame, .frame_info = rx_control_frame_info, .shot = rx_control_shot, .setting = rx_control_setting,
@@ -2268,7 +2327,7 @@ static HosControlGame game = {
     .mem_write = game_mem_write, .save_root = game_save_root, .log = game_log, .quit = game_quit,
     .renderer = game_renderer, .map = hos_oot_current_map, .destination = hos_oot_destination,
     .teleport = hos_oot_teleport_ask, .teleport_result = hos_oot_teleport_result,
-    .teleport_cancel = hos_oot_teleport_cancel, .oot_state = hos_oot_state};
+    .teleport_cancel = hos_oot_teleport_cancel, .age = hos_oot_age_ask, .oot_state = hos_oot_state};
 
 void hos_control_start(const char *version) {
     const char *path = getenv("HOS_CONTROL");

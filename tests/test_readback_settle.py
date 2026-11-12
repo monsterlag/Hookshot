@@ -21,17 +21,22 @@ def body(src, signature):
 def main():
     replay = (ROOT / "gpu" / "vk" / "vk_replay.cpp").read_text(encoding="utf-8")
     inv = body(replay, "void invalidate(uint64_t gpu, uint64_t size) {")
-    lookup = "const uint64_t v = memory_writeback_value(host->gpu_guest(gpu), size, nullptr);"
+    lookup = "const uint64_t v = memory_writeback_value(host->gpu_guest(gpu), size, nullptr, &part, &whole);"
     if lookup not in inv:
         raise SystemExit("invalidate no longer looks up the range's write-back value: update this test")
     before = inv[:inv.index(lookup)]
     if "!no_catchup && !unforced" in before:
         raise SystemExit("the readback skips its catch-up with per-queue fences: stopped work that writes the range is "
                          "read before it is recorded")
-    settle = before.rfind("unforced ? sync_settle() : wait_queue_empty();")
+    # (sync_settle_met: sync_settle when the CPU has signalled an event since the queues were last looked at, which is the
+    # only way a queue is stopped at a met wait with nobody to let it on; tests/test_readback_part.py runs it)
+    settle = before.rfind("else if (sync_settle_met())")
     if settle < 0 or "if (behind0 && !no_catchup) {" not in before[:settle]:
         raise SystemExit("the readback's catch-up before the write-back lookup is gone, or no longer settles with "
                          "per-queue fences (sync_settle: the met waits only, never forced)")
+    met = body(replay, "bool sync_settle_met() {")
+    if "sync_settle();" not in met:
+        raise SystemExit("sync_settle_met no longer settles")
     print("PASS: a readback settles the met stopped work before it looks up the write-back")
 
 

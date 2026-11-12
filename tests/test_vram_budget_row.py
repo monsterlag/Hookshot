@@ -120,6 +120,7 @@ static void restart(bool write_memory_budget) {
     vram_budget_sync();
 }
 int main() {
+    (void)kVramMinimumOnly;   // (TABLES carries it, the row's step that reads it does not come along: clang's -Wunused-const-variable)
     // (each preset's budgets as before the row: 2200/256, 3600/512, 4800/1024, 7500/2048, 11000/3072)
     const int texture[] = {0, 2200, 3600, 4800, 7500, 11000}, mirror[] = {0, 256, 512, 1024, 2048, 3072};
     for (int p = 1; p <= 5; p++) {

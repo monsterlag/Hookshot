@@ -1,18 +1,16 @@
-"""The Debug tab's Teleport and Switch age do not leave the minimap hidden (host/hos_main.c, oot_teleport; issue 2217).
+"""The debug teleport's minimap repair survives a save and reload (issues 2217, 2588).
 
-An area that hides the minimap while Link is in it sets the game's MapIconDeactivateByAreaActor flag, which is saved, and
-shows the minimap again as he walks out. The cheats' map change took him out without that: the flag stayed set, and no
-area had a minimap from then on, in that save and every one made from it. oot_teleport now clears the flag with its
-request.
+An area's saved MapIconDeactivateByAreaActor flag can outlive a debug teleport. Clearing only its live byte restores
+the HUD but leaves the save's copy hidden. The teleport must use the game's queued Bool setter, which owns both.
 
-Linux only (the stand-in game is a mapping of the guest's addresses). Builds oot_teleport and what it calls, from the
-source as it is, over a stand-in for the game: its GameDataMgr with the flags' table, its event manager, and the five
-game functions the teleport calls. Then:
+Linux only (the stand-in game is a mapping of the guest's addresses). Builds oot_teleport and what it calls from the
+source over a stand-in GameDataMgr, event manager and guest functions. The fixture keeps the live flags and serialized
+flags separate: only processing an engine-setter request updates both. It checks:
 
-- from an area that hid the minimap, a teleport that is sent clears the flag, and says so in the log;
-- with the flag clear, nothing is written and nothing is said;
-- a teleport the cheats refuse (an event is playing; a request from a moment ago is still in progress), or one the game's
-  event manager does not take (it answers 0), leaves the flag: Link is still in the area.
+- an accepted teleport queues the repair, preserves the caller's registers, and survives a simulated save/reload;
+- an already-visible minimap does not queue a write or log a repair;
+- a refused/throttled teleport, or an event-manager answer of 0, changes neither live nor serialized state;
+- unavailable setter bindings do not fall back to a misleading live-only repair.
 
 python -I -B tests/test_teleport_minimap_flag.py [--cc gcc]
 """
@@ -68,6 +66,19 @@ static void game_get_bool(Ctx *c) {   /* f_8022d9c0(mgr, out, hash) */
     for (uint32_t i = 0; i < 3; i++)
         if (flags[i] == (uint32_t)c->x[2]) *A64_PTR(c->x[1]) = *A64_PTR(BOOLS + i * 24 + 22), c->x[0] = 1;
 }
+static int set_available = 1, set_calls, set_args_bad, pending, pending_value, saved_hidden;
+static void game_set_bool(Ctx *c) {
+    set_args_bad |= c->x[0] != MGR || c->x[1] > 1 || c->x[2] != flags[2];
+    set_calls++, pending = 1, pending_value = (int)c->x[1];
+    c->x[0] = 0xdead, c->x[2] = 0xbeef;   /* guest calls may clobber registers */
+}
+static void game_tick(void) {
+    if (pending) {
+        *A64_PTR(BOOLS + 2 * 24 + 22) = (uint8_t)pending_value;
+        saved_hidden = pending_value;
+        pending = 0;
+    }
+}
 static void game_make_arg(Ctx *c) {   /* an empty EventRequestArg: 8 entries with room for their names, and the event's name */
     const uint64_t arg = c->x[0];
     recomp_store32(c, arg, 8), recomp_store64(c, arg + 8, ENTRIES), recomp_store32(c, arg + 16, 0);
@@ -79,7 +90,8 @@ static uint64_t answer = 1;   /* the event manager's answer: 0 when it does not 
 static void game_request(Ctx *c) { requests++, c->x[0] = answer; }
 static void game_nothing(Ctx *c) { (void)c; }
 static A64Fn a64_lookup(uint64_t a) {
-    return a == 0x8022d9c0ULL ? game_get_bool : a == 0x80d99f10ULL ? game_make_arg : a == 0x80d9a820ULL ? game_request :
+    return a == 0x8022d9c0ULL ? game_get_bool : a == 0x806a2b20ULL ? (set_available ? game_set_bool : NULL) :
+           a == 0x80d99f10ULL ? game_make_arg : a == 0x80d9a820ULL ? game_request :
            a == 0x802dc440ULL || a == 0x8022b6f0ULL || a == 0x80cd0ea0ULL ? game_nothing : NULL;
 }
 static int oot_gamedata_bool(Ctx *c, uint32_t hash, int *value);
@@ -103,7 +115,7 @@ static void game_start(void) {
     *A64_PTR(BOOLS + 0 * 24 + 22) = 1;   /* a child */
 }
 static int hidden(void) { return *A64_PTR(BOOLS + 2 * 24 + 22); }
-static void hide(int on) { *A64_PTR(BOOLS + 2 * 24 + 22) = (uint8_t)on; }
+static void hide(int on) { *A64_PTR(BOOLS + 2 * 24 + 22) = (uint8_t)on; saved_hidden = on; }
 static int failed;
 static void check(int ok, const char *what) {
     if (!ok) printf("FAIL: %s\n", what), failed = 1;
@@ -111,35 +123,55 @@ static void check(int ok, const char *what) {
 
 int main(void) {
     Ctx c = {0};
+    for (unsigned i = 0; i < 32; i++) c.x[i] = 0x12340000ULL + i;
     c.x[31] = 0x40000000ULL;
+    const Ctx original = c;
     game_start();
     const char *line = "the area left had hidden the minimap";
 
     hide(1);
     check(oot_teleport(&c, 0x50000000ULL, 1) == 1 && requests == 1, "the teleport was not sent");
+    check(set_calls == 1 && pending && !set_args_bad, "the repair did not use the engine's Bool setter (mgr, value, hash)");
+    check(hidden() && saved_hidden, "the repair wrote live state outside the engine setter");
+    game_tick();   /* the game's normal update processes its queued changes before a save */
     check(!hidden(), "a teleport out of an area that hid the minimap left it hidden (MapIconDeactivateByAreaActor still set)");
     check(strstr(said, line) != NULL, "the log does not say the minimap was shown again");
-    check(c.x[31] == 0x40000000ULL, "the game's registers were not put back");
+    check(!saved_hidden, "a native save after teleport kept the minimap hidden");
+    *A64_PTR(BOOLS + 2 * 24 + 22) = (uint8_t)saved_hidden;   /* a reload of the serialized value */
+    check(!hidden(), "the minimap disappeared again after a save and reload");
+    check(!memcmp(&c, &original, sizeof c), "the game's registers were not put back");
 
     clock_ns += 9000000000LL, said[0] = 0;
     check(oot_teleport(&c, 0x50000000ULL, 3) == 1 && requests == 2 && !hidden(), "a teleport with the minimap shown");
+    check(set_calls == 1 && !pending && !saved_hidden, "a visible minimap queued a redundant repair");
     check(strstr(said, line) == NULL, "the log speaks of the minimap when nothing hid it");
 
     clock_ns += 9000000000LL, hide(1);
     recomp_store64(&c, EVENTS + 104, 0x51000000ULL);   /* an event is playing: the teleport waits */
     check(oot_teleport(&c, 0x50000000ULL, 1) == 0 && requests == 2, "a teleport was sent while an event played");
     check(hidden(), "a teleport that was refused showed the minimap of the area Link is still in");
+    check(set_calls == 1 && !pending && saved_hidden, "a refused teleport changed the saved state");
     recomp_store64(&c, EVENTS + 104, 0);
 
-    check(oot_teleport(&c, 0x50000000ULL, 1) == 1 && requests == 3 && !hidden(), "the teleport after the event");
+    check(oot_teleport(&c, 0x50000000ULL, 1) == 1 && requests == 3, "the teleport after the event");
+    game_tick();
+    check(set_calls == 2 && !hidden() && !saved_hidden, "the teleport after the event did not repair both values");
     hide(1);   /* (the area he arrived in hides its own) */
     clock_ns += 1000000000LL;
     check(oot_teleport(&c, 0x50000000ULL, 3) == 0 && requests == 3, "a second teleport was sent a second after the first");
     check(hidden(), "a teleport that was ignored showed the minimap");
+    check(set_calls == 2 && !pending && saved_hidden, "a throttled teleport changed the saved state");
 
     clock_ns += 9000000000LL, answer = 0;   /* sent, but the event manager does not take it: the map does not change */
     check(oot_teleport(&c, 0x50000000ULL, 1) == 1 && requests == 4, "the teleport the game turned down was not sent");
     check(hidden(), "a teleport the game turned down showed the minimap of the area Link is still in");
+    check(set_calls == 2 && !pending && saved_hidden, "a declined request changed the saved state");
+
+    clock_ns += 9000000000LL, answer = 1, set_available = 0, said[0] = 0;
+    check(oot_teleport(&c, 0x50000000ULL, 1) == 1 && requests == 5, "the teleport with no setter binding was not sent");
+    check(hidden() && saved_hidden && set_calls == 2 && !pending, "a missing setter fell back to a live-only write");
+    check(strstr(said, "restore queued") == NULL, "a missing setter logged a successful repair");
+    check(strstr(said, "the game's Bool setter not found, left hidden") != NULL, "a missing setter was not named in the log");
     return failed;
 }
 '''
@@ -154,8 +186,8 @@ def block_end(text, start):
     return end
 
 
-def build(cc, tmp):
-    source = (ROOT / "host" / "hos_main.c").read_text(encoding="utf-8")
+def build(cc, tmp, source_path=None):
+    source = (source_path or ROOT / "host" / "hos_main.c").read_text(encoding="utf-8")
     places = source.index("typedef struct {\n    const char *child_banc")   # (OotDestination and the table of them)
     places = source[places:source.index("};", source.index("static const OotDestination oot_destinations[] = {")) + 2]
     start = source.index("#define OOT_GAMEDATA_SLOT")
@@ -169,15 +201,16 @@ def build(cc, tmp):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--cc", default="gcc")
+    p.add_argument("--source", type=Path, help="host/hos_main.c from another revision (the regression negative)")
     a = p.parse_args()
     if os.name == "nt" or sys.platform == "darwin":
         print("SKIP: the stand-in game maps the guest's addresses as Linux does")
         return
     with tempfile.TemporaryDirectory(prefix="teleport-minimap-") as tmp:
-        r = subprocess.run([str(build(a.cc, Path(tmp)))], capture_output=True, text=True, timeout=60)
+        r = subprocess.run([str(build(a.cc, Path(tmp), a.source))], capture_output=True, text=True, timeout=60)
     if r.returncode:
         raise SystemExit("test_teleport_minimap_flag: %s" % (r.stdout.strip() or "the stand-in stopped with %d" % r.returncode))
-    print("PASS: a teleport that is sent shows the minimap an area had hidden; one that is refused leaves it")
+    print("PASS: accepted teleport repairs live and saved minimap state; refusals and missing bindings leave it alone")
 
 
 if __name__ == "__main__":

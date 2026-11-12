@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define MKWVK_API_VERSION 18
+#define MKWVK_API_VERSION 21
 enum { HOS_OPT_CHEAT_HEARTS = 32, HOS_OPT_CHEAT_FLIGHT, HOS_OPT_CHEAT_ACTION, HOS_OPT_CHEAT_CAMERA, HOS_OPT_CHEAT_SPEED };
 /* (hookshot) the Gameplay tab's Text size (host/oot_text_size.c): 0 the game's, 1 110%, 2 125%, 3 150%, 4 175% */
 enum { HOS_OPT_TEXT_SIZE = 10 };
@@ -47,6 +47,10 @@ enum { HOS_OPT_HDR_TONEMAP = 47 };
 /* Gameplay's vertical field of view, percent of the game's current angle; 100 is unchanged. */
 /* 49 and 50 are reserved for Walk mode and Walk speed (#2345). */
 enum { HOS_OPT_FOV = 51 };
+/* (HOS_OPT_SKIP_OPENING, 52: Gameplay's Skip opening, host/hos_main.c hos_oot_opening. Off. The new-game story movie
+   and Navi waking Link. 44 stays reserved for Skip title, 49 and 50 for Walk, 60 for the item wheel. A new option id
+   answered by the existing option callback does not change MkwVkHost or MkwVkRenderer.) */
+enum { HOS_OPT_SKIP_OPENING = 52 };
 
 /* (hookshot) the controls' names (host/nn_hid.c, host/pad_sdl.c, the pad_ and key_ lines of hookshot_options.ini):
    the Switch's buttons in nn::hid's bit order, and a gamepad's inputs by position (the bottom face button first:
@@ -64,16 +68,20 @@ enum { HOS_PAD_ART_N = HOS_PAD_RTRIGGER + 1 };
    gpu/vk/vk_menu.cpp): its own bit past HOS_PAD_N, so it is not one of the inputs the Controls page binds */
 enum { HOS_PAD_TOUCHPAD = 31 };
 enum { HOS_BIND_PAD, HOS_BIND_KEY };
-/* (hookshot) the controller faces of the button prompts (host/prompts.c): the Switch, then nx2/prompt_faces.py FACES' order;
-   the Button prompts row's value is one more (0 Auto) */
-enum { HOS_PROMPT_SWITCH, HOS_PROMPT_XBOX, HOS_PROMPT_PS4, HOS_PROMPT_PS5, HOS_PROMPT_STEAMDECK, HOS_PROMPT_N };
+/* (hookshot) the controller faces of the button prompts (host/prompts.c): the Switch, then nx2/prompt_faces.py FACES' order,
+   then the keyboard's (nx2/prompt_keys.py: the keys bound, not the pad inputs); the Button prompts row's value is one more (0
+   Auto) */
+enum { HOS_PROMPT_SWITCH, HOS_PROMPT_XBOX, HOS_PROMPT_PS4, HOS_PROMPT_PS5, HOS_PROMPT_STEAMDECK, HOS_PROMPT_KEYBOARD, HOS_PROMPT_N };
 /* (hookshot) what of the button prompts follows a new face or new controls at once (MkwVkHost.prompts_live, a bit each):
    the textures (the ocarina's notes, the Talk ring's letters, the System page's controller), the layouts (the Talk ring's
    places, the ocarina hint's spacing), the icons in texts; the rest at the next start */
 enum { HOS_PROMPTS_LIVE_TEXTURES = 1, HOS_PROMPTS_LIVE_LAYOUTS = 2, HOS_PROMPTS_LIVE_TEXTS = 4, HOS_PROMPTS_LIVE_ALL = 7 };
-/* keys only (HOS_BIND_KEY), after the Switch's buttons: the left stick's and the camera's directions */
+/* keys only (HOS_BIND_KEY), after the Switch's buttons: the left stick's and the camera's directions, and the
+   ocarina's five note controls (which take a gamepad input too, and share it: a note's key can be some other
+   control's key at once, host/nn_hid.c has_pad) */
 enum { HOS_KEY_MOVE_UP = HOS_SW_N, HOS_KEY_MOVE_DOWN, HOS_KEY_MOVE_LEFT, HOS_KEY_MOVE_RIGHT, HOS_KEY_CAM_UP,
-       HOS_KEY_CAM_DOWN, HOS_KEY_CAM_LEFT, HOS_KEY_CAM_RIGHT, HOS_KEY_N };
+       HOS_KEY_CAM_DOWN, HOS_KEY_CAM_LEFT, HOS_KEY_CAM_RIGHT, HOS_KEY_OC_NOTE_L, HOS_KEY_OC_NOTE_R,
+       HOS_KEY_OC_NOTE_A, HOS_KEY_OC_NOTE_Y, HOS_KEY_OC_NOTE_X, HOS_KEY_N };
 
 /* (hookshot) the mouse over the window while it is free (not captured): the Insert menu's (host/display.c,
    host/posix/display_sdl.c). x and y: the cursor in the window's pixels, of a window width x height pixels (the
@@ -141,7 +149,8 @@ typedef struct MkwVkHost {
     /* (hookshot) the controls, for the Insert menu's Controls page. button: the Switch's, HOS_SW_*; set HOS_BIND_PAD:
        the gamepad inputs that press it (HOS_PAD_* positions, -1 none; slots 0 and 1); set HOS_BIND_KEY: the keys that
        do (Windows key codes, 0 none; slots 0 and 1; a mouse button's too, and HOS_KEY_* past the Switch's buttons).
-       bind with button -1: all back to their defaults */
+       bind with button -1: all back to their defaults.
+       (version 19: HOS_BIND_PAD takes the ocarina's note rows too, HOS_KEY_OC_NOTE_*, which start unset) */
     int (*binding)(int set, int button, int slot);
     void (*bind)(int set, int button, int slot, int code);
     /// Display aspect of the presented picture, after crop: the camera aspect applied at startup.
@@ -183,6 +192,9 @@ typedef struct MkwVkHost {
     /* (version 17, hookshot) what of the button prompts a change of face or controls reaches at once (host/prompts.c):
        HOS_PROMPTS_LIVE_* bits; 0 none (a mod's files, built without the prompts, or not loaded yet) */
     int (*prompts_live)(void);
+    /* (version 20, hookshot) the main screen's size in pixels, as host/hos_main.c takes its shape at the start (Windows: the
+       primary's; Linux: SDL's primary desktop), for the Insert menu's Aspect ratio and Output resolution rows: 0 when not known */
+    int (*screen_size)(int *width, int *height);
 } MkwVkHost;
 
 /* One completed temporal-upscale sample; all zero while inactive. */
@@ -254,6 +266,10 @@ typedef struct MkwVkRenderer {
        to choose on this PC, -2 no step of a list row reaches value here, left as it was) */
     int (*setting)(int index, MkwVkSetting *out);
     int (*setting_set)(const char *key, int value, MkwVkSetting *out);
+    /* (version 21, hookshot: 20 is the host's screen_size, which main added while this was 20 on its branch) the game gave a program its shaders (nvnProgramSetShaders, nvnProgramInitializeFromBuilder), on the
+       game's thread, before any draw uses it: what the back end kept ready for it can be loaded now (gpu/vk/vk_programs.cpp).
+       Its stages' code and control sections are in the game's memory at this call */
+    void (*nvn_program_created)(const nvn_prog *p);
 } MkwVkRenderer;
 
 /* the DLL's one export: null when Vulkan is not usable (the executable then falls back to WebGPU) */
@@ -269,7 +285,7 @@ __attribute__((visibility("default"))) const MkwVkRenderer *mkwvk_init(const Mkw
 #ifndef _WIN32
 /* (linux) what start() is given in place of a window handle (host/posix/display_sdl.c): the window makes the
    surface (SDL_Vulkan_CreateSurface: X11 or Wayland) and says its size in pixels */
-#define MKWVK_WINDOW_VERSION 2
+#define MKWVK_WINDOW_VERSION 3
 typedef struct MkwVkWindow {
     uint32_t version;   /* MKWVK_WINDOW_VERSION */
     int (*create_surface)(void *window, void *instance, void *surface_out);   /* (VkInstance, VkSurfaceKHR *): 1 if made */
@@ -277,6 +293,8 @@ typedef struct MkwVkWindow {
     void *window;
     /* (version 2) the refresh rate of the display the window is on, in mHz; 0 when not known (frame generation's Auto) */
     int (*refresh_mhz)(void *window);
+    /* (version 3) the desktop's size in pixels, 0 x 0 when not known (the Quality preset Auto (this PC)) */
+    void (*desktop_size)(void *window, int *width, int *height);
 } MkwVkWindow;
 #endif
 

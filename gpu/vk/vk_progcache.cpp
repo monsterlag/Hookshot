@@ -31,12 +31,16 @@
 #include <unordered_set>
 #include <vector>
 
+#include "zstd.h"
+
 #include "shader_recompiler/shader_info.h"
 #include "hookshot_env.h"
+#include "fallback_loaded.h"
 #include "fallback_size_policy.h"
 #include "vk_paths.h"
 #include "vk_internal.h"
 #include "vk_progcache.h"
+#include "vk_programs.h"
 
 namespace mkwvk {
 
@@ -87,11 +91,16 @@ FILE* disk_out = nullptr;
 FILE* disk_idx = nullptr;
 bool disk_listing = false;
 bool disk_on = false;
+bool disk_zstd = false;   // (hookshot) RX_VK_PROGRAM_CACHE_ZSTD=1: records compressed with zstd, hookshot_programs.zst.bin
 std::atomic<int64_t> st_cache_hits{0};
 constexpr uint32_t kDiskMagic = 0x31505348;
+constexpr uint32_t kDiskMagicZstd = 0x32505348;   // ("HSP2": a 20-byte record head, key, stored size, kind)
 constexpr uint32_t kIdxMagic = 0x58495048;   // ("HPIX", then a version and the cache's stamp; 20 bytes a record: key, size, kind)
 constexpr uint32_t kIdxVersion = 1;
 constexpr size_t kIdxEntry = 20;
+// (the index's kind word is the record's first flags word: bits 0-3 are compute/mesh/fallback/fallback_task)
+constexpr uint32_t kCompressedKind = 16;   // (a zstd record: 8-byte unpacked size, then the frame)
+constexpr size_t kZstdHead = 20;           // (the zstd cache's record head: key, stored size, kind; the old cache's is 16)
 
 void idx_put(std::vector<uint8_t>& o, uint64_t key, uint64_t size, uint32_t kind) {
     uint8_t e[kIdxEntry];
@@ -120,10 +129,13 @@ void disk_init() {
     static std::once_flag once;
     std::call_once(once, [] {
         if (env_on("RX_VK_NO_PROGRAM_CACHE")) return;
+        // (hookshot) RX_VK_PROGRAM_CACHE_ZSTD=1: each record compressed with zstd, in a file of its own so that a build
+        // without this switch never reads it. SPIR-V compresses about 7.7x at zstd's level 3.
+        disk_zstd = env_on("RX_VK_PROGRAM_CACHE_ZSTD");
         char exe[MAX_PATH];
         const DWORD n = game_module_path(exe, MAX_PATH);
         std::string path(exe, n);
-        path = path.substr(0, path.find_last_of("\\/") + 1) + "hookshot_programs.bin";
+        path = path.substr(0, path.find_last_of("\\/") + 1) + (disk_zstd ? "hookshot_programs.zst.bin" : "hookshot_programs.bin");
         // (one Hookshot at a time on a cache: a second one, started while the first wrote, took the record being written for one
         // cut short and cut the file there, under the first, whose list of records then named bytes written over since. Held
         // until the process ends)
@@ -145,6 +157,8 @@ void disk_init() {
             }
         }
         const uint64_t stamp = program_cache_stamp();
+        const size_t head_size = disk_zstd ? kZstdHead : 16;   // (the zstd cache's head has the record's kind too)
+        const uint32_t magic = disk_zstd ? kDiskMagicZstd : kDiskMagic;
         // (hookshot_programs.idx: the records' heads, 20 bytes each, in the file's order. The records follow one another in the
         // file, so finding them was a read of each one's head, 22000 of them over the 4 GB: seconds at every start, each a read
         // somewhere else on the disk (and on a compressed file system a block of 128 KB unpacked for those 20 bytes). The index
@@ -161,7 +175,7 @@ void disk_init() {
             _fseeki64(f, 0, SEEK_SET);
             uint32_t head[2]{};
             uint64_t kept = 0;
-            if (whole >= 16 && fread(head, 4, 2, f) == 2 && fread(&kept, 8, 1, f) == 1 && head[0] == kDiskMagic && kept == stamp) {
+            if (whole >= 16 && fread(head, 4, 2, f) == 2 && fread(&kept, 8, 1, f) == 1 && head[0] == magic && kept == stamp) {
                 good = 16;
                 size_t idx_n = 0;
                 bool idx_short = false;   // (it named records the file does not have whole)
@@ -186,12 +200,12 @@ void disk_init() {
                             uint64_t key, size;
                             uint32_t kind;
                             std::memcpy(&key, e, 8), std::memcpy(&size, e + 8, 8), std::memcpy(&kind, e + 16, 4);
-                            if (size > (uint64_t)whole || at + 16 + (int64_t)size > whole) {
+                            if (size > (uint64_t)whole || at + (int64_t)head_size + (int64_t)size > whole) {
                                 idx_short = true;
                                 break;
                             }
-                            order.push_back({key, {at + 16, (size_t)size, kind}});
-                            at += 16 + (int64_t)size;
+                            order.push_back({key, {at + (int64_t)head_size, (size_t)size, kind}});
+                            at += (int64_t)head_size + (int64_t)size;
                         }
                         // (the last one's head as the file has it: an index of another file, or of this one before it was cut
                         // or made again, is not taken)
@@ -200,7 +214,7 @@ void disk_init() {
                             const auto& [key, d] = order.back();
                             uint64_t rec[2]{};
                             uint32_t kind = 0;
-                            _fseeki64(f, d.at - 16, SEEK_SET);
+                            _fseeki64(f, d.at - (int64_t)head_size, SEEK_SET);
                             same = fread(rec, 8, 2, f) == 2 && fread(&kind, 4, 1, f) == 1 && rec[0] == key && rec[1] == d.size &&
                                    kind == d.kind;
                         }
@@ -219,9 +233,9 @@ void disk_init() {
                     uint32_t kind = 0;
                     _fseeki64(f, good, SEEK_SET);
                     if (fread(rec, 8, 2, f) != 2 || fread(&kind, 4, 1, f) != 1) break;
-                    if (rec[1] > (uint64_t)(whole - good - 16)) break;   // (the run stopped while writing it; unsigned: no size wraps)
-                    order.push_back({rec[0], {good + 16, (size_t)rec[1], kind}});
-                    good += 16 + (int64_t)rec[1];
+                    if (rec[1] > (uint64_t)(whole - (size_t)good - head_size)) break;   // (the run stopped while writing it; unsigned: no size wraps)
+                    order.push_back({rec[0], {good + (int64_t)head_size, (size_t)rec[1], kind}});
+                    good += (int64_t)head_size + (int64_t)rec[1];
                     scanned++;
                 }
                 if (scanned) idx_whole = false;
@@ -239,7 +253,7 @@ void disk_init() {
         } else {
             disk_out = fopen(path.c_str(), "wb");
             if (disk_out) {
-                const uint32_t h[2] = {kDiskMagic, 0};
+                const uint32_t h[2] = {magic, 0};
                 fwrite(h, 4, 2, disk_out);
                 fwrite(&stamp, 8, 1, disk_out);
                 fflush(disk_out);
@@ -371,44 +385,104 @@ void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t
         put_list(o, st.c1);
         put_info(o, st.info);
     }
-    const uint64_t head[2] = {p.key, o.size()};
+    const uint32_t flags = *(const uint32_t*)o.data();
+    std::vector<uint8_t> compressed;
+    bool compressed_ok = false;
+    if (disk_zstd && o.size() >= 256) {
+        compressed.resize(ZSTD_compressBound(o.size()));
+        const size_t n = ZSTD_compress(compressed.data(), compressed.size(), o.data(), o.size(), 3);
+        if (!ZSTD_isError(n) && n + 8 < o.size()) {
+            compressed.resize(n);
+            compressed_ok = true;
+        }
+    }
+    const uint64_t stored = compressed_ok ? 8 + (uint64_t)compressed.size() : (uint64_t)o.size();
+    const uint32_t kind = flags | (compressed_ok ? kCompressedKind : 0);
+    const size_t head_size = disk_zstd ? kZstdHead : 16;
+    const uint64_t head[2] = {p.key, stored};
     std::lock_guard lk(disk_mu);
     _fseeki64(disk_out, 0, SEEK_END);
     const int64_t at = _ftelli64(disk_out);
     fwrite(head, 8, 2, disk_out);
-    fwrite(o.data(), 1, o.size(), disk_out);
+    if (disk_zstd) fwrite(&kind, 4, 1, disk_out);
+    if (compressed_ok) {
+        const uint64_t usize = o.size();
+        fwrite(&usize, 8, 1, disk_out);
+        fwrite(compressed.data(), 1, compressed.size(), disk_out);
+    } else {
+        fwrite(o.data(), 1, o.size(), disk_out);
+    }
     fflush(disk_out);
     if (disk_idx) {   // (after the record: an index ahead of the file would name a record it does not have)
         std::vector<uint8_t> e;
-        idx_put(e, p.key, o.size(), *(const uint32_t*)o.data());
+        idx_put(e, p.key, stored, kind);
         fwrite(e.data(), 1, e.size(), disk_idx);
         fflush(disk_idx);
     }
     // (the precompile's: nothing holds them but the file, and the game starts on them at once)
-    if (disk_listing) disk_records[p.key].push_back({at + 16, o.size(), (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | (p.fallback ? 4 : 0))});
+    if (disk_listing) disk_records[p.key].push_back({at + (int64_t)head_size, (size_t)stored, kind});
+}
+
+bool program_cache_payload(const uint8_t* stored, size_t stored_size, uint32_t kind, std::vector<uint8_t>& plain,
+                           const uint8_t** payload, size_t* payload_size) {
+    *payload = stored;
+    *payload_size = stored_size;
+    if (!(kind & kCompressedKind)) return true;
+    if (stored_size < 8) return false;
+    uint64_t usize;
+    std::memcpy(&usize, stored, 8);
+    if (usize < 4 || usize > (1ull << 31)) return false;
+    plain.resize((size_t)usize);
+    const size_t n = ZSTD_decompress(plain.data(), plain.size(), stored + 8, stored_size - 8);
+    if (ZSTD_isError(n) || n != plain.size()) return false;
+    *payload = plain.data();
+    *payload_size = plain.size();
+    return true;
 }
 
 /// The kept variants of key read from the file (in: a handle on it, used under mu when given) and made ready, to variants
 void program_cache_read(FILE* in, std::mutex* mu, uint64_t key, const std::vector<DiskRecord>& recs,
                         std::vector<std::unique_ptr<Program>>& variants) {
     for (const DiskRecord& d : recs) {
-        std::vector<uint8_t> data(16 + d.size);   // (with its head, the key and size: the index's word is checked against the file's)
+        // (the census: the records each thread reads, and those read in play, vk_programs.h)
+        struct Counted {
+            const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+            ~Counted() {
+                const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+                use_counters.loads++, use_counters.load_ns += ns;
+                if (programs_in_play.load(std::memory_order_relaxed) && !use_counters.background) census.play_loads++, census.play_load_ns += ns;
+            }
+        } counted;
+        const size_t head_size = disk_zstd ? kZstdHead : 16;
+        std::vector<uint8_t> data(head_size + d.size);   // (with its head: the key, size and kind are checked against the file's)
         {
             std::unique_lock<std::mutex> lk;
             if (mu) lk = std::unique_lock<std::mutex>(*mu);
-            _fseeki64(in, d.at - 16, SEEK_SET);
+            _fseeki64(in, d.at - (int64_t)head_size, SEEK_SET);
             if (fread(data.data(), 1, data.size(), in) != data.size()) continue;
         }
         uint64_t head[2];
         std::memcpy(head, data.data(), 16);
-        if (head[0] != key || head[1] != d.size) {
+        uint32_t kind = 0;
+        if (disk_zstd) std::memcpy(&kind, data.data() + 16, 4);
+        if (head[0] != key || head[1] != d.size || (disk_zstd && kind != d.kind)) {
             static std::atomic<int> logged{0};
             if (logged++ < 20)
                 logf("vk: program cache: no record of program %016llx at %lld as the index said: translated again", (unsigned long long)key,
                      (long long)d.at);
             continue;
         }
-        Reader r{data.data() + 16, data.data() + data.size()};
+        std::vector<uint8_t> plain;
+        const uint8_t* payload = nullptr;
+        size_t payload_size = 0;
+        if (!program_cache_payload(data.data() + head_size, d.size, d.kind, plain, &payload, &payload_size)) {
+            static std::atomic<int> logged{0};
+            if (logged++ < 20)
+                logf("vk: program cache: the compressed record of program %016llx at %lld did not unpack: translated again",
+                     (unsigned long long)key, (long long)d.at);
+            continue;
+        }
+        Reader r{payload, payload + payload_size};
         auto p = std::make_unique<Program>();
         p->key = key;
         get_head(r, *p);
@@ -453,10 +527,122 @@ void program_cache_read(FILE* in, std::mutex* mu, uint64_t key, const std::vecto
     }
 }
 
+// ---- (hookshot) A compute program's kept variants, read at its first dispatch without their code. A key has up to 64 kept
+// variants (the texture answers the prepare tried), and the dispatch runs one: which one is decided from each variant's answers
+// and its stage's descriptors (vk_shader.cpp still_valid), not from its SPIR-V. Reading every variant whole and making a module
+// of each was half of what a first dispatch cost on the thread replaying (RTX 3090, a tour with no compute program kept ready:
+// 148 first dispatches read 865 variants, 111 MB, 541 ms of their 1,048 ms; a 64-variant program 48 to 72 ms). Now each
+// variant's head and descriptors are read by position around its SPIR-V, the program is given to the pick as it is, and the
+// one the dispatch takes gets its code read and its module made (program_cache_complete). RX_VK_LOAD_ALL_VARIANTS=1: every
+// variant whole, as before ----
+// (where the code of a program read without it is: kept in the program itself, Program::code_at and code_words, not in a table
+// by the program's address, which a program let go and another made at the same address would find a stale entry in)
+namespace {
+std::mutex light_mu;
+}   // namespace
+/// A kept record's program without its code. nullptr: not a record to read this way (more than one stage, a head longer than
+/// kFront or a tail longer than kTailMost, one that does not read): it is read whole, as before
+std::unique_ptr<Program> program_cache_read_light(FILE* in, std::mutex* mu, uint64_t key, const DiskRecord& d) {
+    // (the compressed cache, RX_VK_PROGRAM_CACHE_ZSTD: a record is one zstd frame behind a 20-byte head, and nothing in it has
+    // a place of its own in the file. Not a record to read this way: the caller reads it whole, program_cache_read unpacks it)
+    if (disk_zstd) return nullptr;
+    constexpr size_t kFront = 4096, kTailMost = 8u << 20;
+    struct Counted {   // (the census, as program_cache_read counts)
+        const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        ~Counted() {
+            const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+            use_counters.loads++, use_counters.load_ns += ns;
+            if (programs_in_play.load(std::memory_order_relaxed) && !use_counters.background) census.play_loads++, census.play_load_ns += ns;
+        }
+    } counted;
+    std::vector<uint8_t> front(16 + std::min(d.size, kFront));
+    {
+        std::unique_lock<std::mutex> lk;
+        if (mu) lk = std::unique_lock<std::mutex>(*mu);
+        _fseeki64(in, d.at - 16, SEEK_SET);
+        if (fread(front.data(), 1, front.size(), in) != front.size()) return nullptr;
+    }
+    uint64_t head[2];
+    std::memcpy(head, front.data(), 16);
+    if (head[0] != key || head[1] != d.size) return nullptr;
+    Reader r{front.data() + 16, front.data() + front.size()};
+    auto p = std::make_unique<Program>();
+    p->key = key;
+    get_head(r, *p);
+    p->variant = answers_hash(*p);
+    if (r.get<uint64_t>() != 1 || r.bad || !p->compute) return nullptr;   // (one stage: a compute program's)
+    p->stages.emplace_back();
+    Stage& st = p->stages.back();
+    st.nvn_stage = r.get<int>();
+    st.vk_stage = r.get<VkShaderStageFlagBits>();
+    const uint64_t words = r.get<uint64_t>();
+    if (r.bad) return nullptr;
+    const size_t code_at = (size_t)(r.p - (front.data() + 16));
+    if (!words || words > (d.size - code_at) / 4) return nullptr;
+    const size_t tail_at = code_at + (size_t)words * 4;
+    if (d.size - tail_at > kTailMost) return nullptr;
+    std::vector<uint8_t> tail(d.size - tail_at);
+    if (!tail.empty()) {
+        std::unique_lock<std::mutex> lk;
+        if (mu) lk = std::unique_lock<std::mutex>(*mu);
+        _fseeki64(in, d.at + (int64_t)tail_at, SEEK_SET);
+        if (fread(tail.data(), 1, tail.size(), in) != tail.size()) return nullptr;
+    }
+    Reader t{tail.data(), tail.data() + tail.size()};
+    t.list(st.c1);
+    get_info(t, st.info);
+    if (t.bad || !answers_fit(*p, p->answers)) return nullptr;
+    p->code_at = d.at + (int64_t)code_at, p->code_words = words;
+    p->ready.store(true, std::memory_order_release);
+    return p;
+}
+namespace {
+/// (in: a handle on the cache's file, used under mu when given) the code read and the module made
+bool complete_from(Program& p, FILE* in, std::mutex* mu) {
+    if (!p.code_words) return !p.failed;
+    const int64_t code_at = p.code_at;
+    std::vector<uint32_t> spirv((size_t)p.code_words);
+    p.code_words = 0;
+    bool ok = in != nullptr;
+    if (ok) {
+        std::unique_lock<std::mutex> dk;
+        if (mu) dk = std::unique_lock<std::mutex>(*mu);
+        _fseeki64(in, code_at, SEEK_SET);
+        ok = fread(spirv.data(), 4, spirv.size(), in) == spirv.size();
+    }
+    Stage& st = p.stages[0];
+    if (ok) st.module = make_module(spirv);
+    if (!ok || !st.module) {
+        static std::atomic<int> logged{0};
+        if (logged++ < 20)
+            logf("vk: program cache: the code of compute program %016llx at %lld did not read or made no module: left out",
+                 (unsigned long long)p.key, (long long)code_at);
+        p.failed = true;
+        return false;
+    }
+    st.phis = fallback_size::spirv_phis(spirv.data(), spirv.size());
+    module_id_learned(p.key, p.variant, st.module);   // (the next run's load makes its pipeline without this read: vk_programs.h)
+    return true;
+}
+}   // namespace
+bool program_cache_complete(Program& p) {
+    std::lock_guard lk(light_mu);
+    return complete_from(p, disk_in, &disk_mu);
+}
+/// (the load at a program's create call, vk_programs.cpp) the same for a program no other thread has yet, with the worker's
+/// own handle on the file: neither light_mu nor disk_mu is held through its read, which a dispatch on the replay's thread
+/// would wait behind
+bool program_cache_complete_unshared(Program& p, FILE* in) {
+    return complete_from(p, in, nullptr);
+}
+
 /// (shader_mu held) the kept variants of key go to its list, ready, once
 void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& variants, bool keep) {
     disk_init();
     if (!disk_on) return;
+    // (a load the game's create call queued for this key (vk_programs.cpp) is run or waited for here, and what it read is in the
+    // list before the rest is looked for: its records are not read twice, and its program is not translated a second time)
+    if (!keep) programs_load_wait(key);
     std::vector<DiskRecord> recs;
     {
         std::lock_guard lk(disk_mu);
@@ -476,7 +662,102 @@ void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& var
         }
     }
     PROF_EXACT();   // (from disk: a mesh program's too)
-    program_cache_read(disk_in, &disk_mu, key, recs, variants);
+    static const bool whole = env_on("RX_VK_LOAD_ALL_VARIANTS");
+    if (keep || whole || recs.empty() || !(recs[0].kind & 1)) {
+        program_cache_read(disk_in, &disk_mu, key, recs, variants);
+        return;
+    }
+    // (a compute program at its first pick: each variant without its code, in the file's order as before; one that does not
+    // read that way, whole)
+#ifndef _WIN32
+    // (two small reads a variant, anywhere in a file of gigabytes that is seldom in memory: all asked of the disk first, so
+    // that it serves them together and not one after the other. A record's head is its first bytes, its descriptors its last)
+    if (disk_in)
+        for (const DiskRecord& d : recs) {
+            posix_fadvise(fileno(disk_in), d.at - 16, 4096, POSIX_FADV_WILLNEED);
+            if (d.size > 8192) posix_fadvise(fileno(disk_in), d.at + (int64_t)d.size - 8192, 8192, POSIX_FADV_WILLNEED);
+        }
+#endif
+    for (const DiskRecord& d : recs) {
+        if (std::unique_ptr<Program> p = program_cache_read_light(disk_in, &disk_mu, key, d)) {
+            variants.push_back(std::move(p));
+            st_cache_hits++;
+        } else {
+            program_cache_read(disk_in, &disk_mu, key, {d}, variants);
+        }
+    }
+}
+
+// ---- (hookshot) The records by position, for the load when the game makes a program (vk_programs.cpp) ----
+bool program_cache_has(uint64_t key) {
+    disk_init();
+    if (!disk_on) return false;
+    std::lock_guard lk(disk_mu);
+    const auto it = disk_records.find(key);
+    return it != disk_records.end() && !it->second.empty();
+}
+std::vector<DiskRecord> program_cache_records(uint64_t key) {
+    disk_init();
+    if (!disk_on) return {};
+    std::lock_guard lk(disk_mu);
+    const auto it = disk_records.find(key);
+    return it == disk_records.end() ? std::vector<DiskRecord>{} : it->second;
+}
+bool program_cache_variant(FILE* in, uint64_t key, const DiskRecord& d, uint64_t* variant) {
+    if (disk_zstd) return false;   // (a compressed record's head is not read by its place: the caller takes the record whole)
+    // (a record's head: its key and size, the kind word, then the answers, which are what its variant is the hash of)
+    constexpr size_t kFront = 1024;
+    std::vector<uint8_t> front(16 + std::min(d.size, kFront));
+    if (!in || _fseeki64(in, d.at - 16, SEEK_SET) || fread(front.data(), 1, front.size(), in) != front.size()) return false;
+    uint64_t head[2];
+    std::memcpy(head, front.data(), 16);
+    if (head[0] != key || head[1] != d.size) return false;
+    Reader r{front.data() + 16, front.data() + front.size()};
+    Program p;
+    r.get<uint32_t>();
+    r.list(p.answers);
+    if (r.bad) return false;   // (more answers than the front holds: the caller reads the record whole)
+    *variant = answers_hash(p);
+    return true;
+}
+std::vector<DiskRecord> program_cache_take(uint64_t key, const std::vector<DiskRecord>& want) {
+    std::vector<DiskRecord> taken;
+    std::lock_guard lk(disk_mu);
+    const auto it = disk_records.find(key);
+    if (it == disk_records.end()) return taken;
+    auto& have = it->second;
+    for (const DiskRecord& w : want) {
+        const auto at = std::find_if(have.begin(), have.end(), [&](const DiskRecord& d) { return d.at == w.at; });
+        if (at == have.end()) continue;
+        taken.push_back(*at);
+        have.erase(at);
+    }
+    auto& gone = disk_taken[key];
+    gone.insert(gone.end(), taken.begin(), taken.end());
+    if (have.empty()) disk_records.erase(it);
+    return taken;
+}
+std::unordered_set<uint64_t> program_cache_kept_keys() {
+    disk_init();
+    std::unordered_set<uint64_t> keys;
+    if (!disk_on) return keys;
+    std::lock_guard lk(disk_mu);
+    for (const auto& kv : disk_records)
+        if (!kv.second.empty()) keys.insert(kv.first);
+    return keys;
+}
+std::vector<uint64_t> program_cache_compute_keys() {
+    disk_init();
+    std::vector<uint64_t> keys;
+    if (!disk_on) return keys;
+    std::lock_guard lk(disk_mu);
+    for (const auto& kv : disk_records)
+        if (!kv.second.empty() && (kv.second[0].kind & 1)) keys.push_back(kv.first);
+    return keys;
+}
+std::string program_cache_path() {
+    disk_init();
+    return disk_on ? disk_path : std::string();
 }
 
 /// (the precompile, before the game: vk_draw.cpp) the kept compute programs and those named, ready, each given to fn. The rest of the
@@ -529,6 +810,16 @@ size_t program_cache_load_some(const std::unordered_set<uint64_t>& wanted, const
         auto& variants = programs[work[i].first];
         for (auto& p : made[i]) variants.push_back(std::move(p));
         for (auto& p : variants) n++, fn(*p);
+    }
+    // (and the mesh fallback programs in memory already, whose records an earlier read took: the state lists' programs in the
+    // start that prepared the shaders. They had no compute pipelines until their first draw, which was left out: fallback_loaded.h)
+    static const bool loaded_too = fallback_loaded::on(getenv("RX_VK_FALLBACK_LOADED"));
+    if (fallbacks && loaded_too) {
+        std::unordered_set<uint64_t> given;
+        for (const auto& w : work) given.insert(w.first);
+        const size_t loaded = fallback_loaded::each(programs, given, fn);
+        if (loaded) logf("vk: %zu mesh fallback programs read in earlier in this start are made ready with the rest", loaded);
+        n += loaded;
     }
     return n;
 }
@@ -604,7 +895,11 @@ void program_cache_each(const std::function<void(const KeptProgram&)>& fn) {
                     _fseeki64(disk_in, d.at, SEEK_SET);
                     if (fread(data.data(), 1, d.size, disk_in) != d.size) continue;
                 }
-                Reader r{data.data(), data.data() + data.size()};
+                std::vector<uint8_t> plain;
+                const uint8_t* payload = nullptr;
+                size_t payload_size = 0;
+                if (!program_cache_payload(data.data(), data.size(), d.kind, plain, &payload, &payload_size)) continue;
+                Reader r{payload, payload + payload_size};
                 Program p;
                 p.key = key;
                 get_head(r, p);   // (the whole head: reading past only part of it took the fallback's fields for the stage count)

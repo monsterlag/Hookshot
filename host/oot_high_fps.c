@@ -1,11 +1,13 @@
 /* (hookshot) The sound manager's job at up to 60 Hz and the physics solver's steps rounded up, with a measured frame step: the
    lifted f_80435300, f_838ceb80 and f_838cfc10 call these (nx2/oot_patches.py); host/oot_high_fps.h has why and the logic.
-   HOS_FPS_LOG (set): what they do, every 600 calls. */
+   HOS_FPS_LOG (on, by the switches' rule: =0 is off): what they do, every 600 calls. */
 #include "hos.h"
 #include "oot_high_fps.h"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdlib.h>
+
+#include "../gpu/vk/compat/hookshot_env.h" /* (env_on: the switches' one rule) */
 
 extern volatile uint32_t hos_frame_seconds_bits;   /* (host/nn_vi.c: the frame's seconds, 0 at a cap of 60) */
 
@@ -13,7 +15,7 @@ static int timed(void) { return __atomic_load_n(&hos_frame_seconds_bits, __ATOMI
 static int fps_log(void) {
     static int on = -1;   /* (read by the game's threads) */
     int v = __atomic_load_n(&on, __ATOMIC_RELAXED);
-    if (v < 0) v = getenv("HOS_FPS_LOG") != NULL, __atomic_store_n(&on, v, __ATOMIC_RELAXED);
+    if (v < 0) v = env_on("HOS_FPS_LOG"), __atomic_store_n(&on, v, __ATOMIC_RELAXED);
     return v;
 }
 

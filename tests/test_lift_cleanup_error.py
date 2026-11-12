@@ -68,7 +68,16 @@ class LiftCleanupErrorTests(unittest.TestCase):
             (self.gen / "a64_table.c").write_text("/* authored table */\n", encoding="utf-8")
             (self.image / "image.bin").write_bytes(b"authored image sentinel")
 
-        self.namespace.update(run=run, write_lift_key=write_key)
+        self.inputs = ["i" * 40]   # (lift_key(planning=False) as the lift starts, then after it: unchanged unless a test says)
+
+        def rekey(exefs, work, env, planning=True):   # (the key taken again after the lift, from what the next build reads)
+            self.assertEqual((exefs, work, env), (str(self.root / "exefs"), str(self.work), {}))
+            if not planning:
+                return self.inputs[0] if len(self.inputs) == 1 else self.inputs.pop(0)
+            self.events.append("rekey")
+            return "c" * 40
+
+        self.namespace.update(run=run, write_lift_key=write_key, lift_key=rekey)
 
     def seed(self, same_key=False):
         self.gen.mkdir(parents=True)
@@ -142,8 +151,8 @@ class LiftCleanupErrorTests(unittest.TestCase):
 
         self.namespace["run"] = run
         self.exercise()
-        self.assertEqual(self.events, ["lift", "key"])
-        self.assertTrue(self.namespace["lifted_before"](str(self.work), "b" * 40))
+        self.assertEqual(self.events, ["lift", "rekey", "key"])
+        self.assertTrue(self.namespace["lifted_before"](str(self.work), "c" * 40))
         for path, data in protected.items():
             self.assertEqual(path.read_bytes(), data)
 
@@ -160,8 +169,8 @@ class LiftCleanupErrorTests(unittest.TestCase):
 
         with mock.patch.object(os, "remove", side_effect=delete):
             self.exercise()
-        self.assertEqual(self.events, ["lift", "key"])
-        self.assertTrue(self.namespace["lifted_before"](str(self.work), "b" * 40))
+        self.assertEqual(self.events, ["lift", "rekey", "key"])
+        self.assertTrue(self.namespace["lifted_before"](str(self.work), "c" * 40))
 
     def test_matching_cached_lift_is_not_cleared(self):
         self.seed(same_key=True)
@@ -173,8 +182,16 @@ class LiftCleanupErrorTests(unittest.TestCase):
 
     def test_first_lift_without_generated_directory(self):
         self.exercise()
-        self.assertEqual(self.events, ["lift", "key"])
+        self.assertEqual(self.events, ["lift", "rekey", "key"])
+        self.assertTrue(self.namespace["lifted_before"](str(self.work), "c" * 40))
+
+    def test_an_input_changed_during_the_lift_keeps_the_key_from_before(self):
+        """A translator file edited while the lift ran: its C is from the old file, so the new key must not vouch for it"""
+        self.inputs = ["i" * 40, "j" * 40]
+        self.exercise()
+        self.assertEqual(self.events, ["lift", "rekey", "key"])   # (taken, then not kept: the comparison came after it)
         self.assertTrue(self.namespace["lifted_before"](str(self.work), "b" * 40))
+        self.assertFalse(self.namespace["lifted_before"](str(self.work), "c" * 40))
 
     def test_failed_lift_leaves_no_fresh_key(self):
         self.seed()

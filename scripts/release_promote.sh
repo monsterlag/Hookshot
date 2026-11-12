@@ -113,7 +113,8 @@ prepare() {
     } >"$dir/notes.md"
     cat "$dir/notes.md"
     if [[ -n $id ]]; then
-        jq -n --rawfile body "$dir/notes.md" '{draft: true, body: $body}' |
+        # (with its tag_name: scripts/release_files.sh publish says what a draft changed without it loses)
+        jq -n --arg t "$tag" --rawfile body "$dir/notes.md" '{tag_name: $t, draft: true, body: $body}' |
             gh api -X PATCH "repos/$GH_REPO/releases/$id" --input - >/dev/null
     else
         gh release create "$tag" --verify-tag --draft --title "$tag" --notes-file "$dir/notes.md" >/dev/null

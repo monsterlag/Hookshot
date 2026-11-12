@@ -92,6 +92,7 @@ uint64_t ub_generation();
 void ub_thread_off();
 /// The pipeline cache to disk (force: whatever was built since the last save; else only after a few new ones)
 void pipeline_cache_save(bool force);
+void pipeline_cache_save_play();   // what play made since the last save, into a play file now
 // (the window closed: what play made since the last save, a few ms; the start's cache is not written there, as before)
 void pipeline_cache_close();
 void pipeline_cache_play();   // (the start-up done: what play makes goes into play files of its own)

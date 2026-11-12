@@ -36,6 +36,7 @@
 #include "vk_texture.h"
 #include "vk_menu.h"
 #include "vk_draw.h"
+#include "vk_programs.h"
 #include "vk_gprof.h"
 #include "vk_dump.h"
 #include "vk_jobs.h"
@@ -47,8 +48,10 @@
 
 #include "host_shaders/astc_decoder_comp_spv.h"
 #include "host_shaders/bc_encoder_comp_spv.h"
+#include "host_shaders/bc7_encoder_comp_spv.h"
 #include "bc_levels.h"
 #include "astc_bc_policy.h"
+#include "drawn_writeback.h"
 #include "vram_compact.h"
 #include "evict_reason.h"
 #include "keep_rendered.h"
@@ -153,7 +156,11 @@ VkFormat view_format_of(VkFormat image, bool astc_decoded, bool bc, int view_nvn
     if (astc_decoded) f = (view_nvn >= 0x87 && view_nvn <= 0x94) ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
     if (bc) {
         if (use != ViewUse::Sample) return VK_FORMAT_UNDEFINED;
-        f = f == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
+        const bool srgb = f == VK_FORMAT_R8G8B8A8_SRGB;
+        if (linear_twin(image) == VK_FORMAT_BC7_UNORM_BLOCK)
+            f = srgb ? VK_FORMAT_BC7_SRGB_BLOCK : VK_FORMAT_BC7_UNORM_BLOCK;
+        else
+            f = srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
     }
     if (use == ViewUse::Storage) f = force_format != VK_FORMAT_UNDEFINED ? force_format : storage_view_format(f);
     if (use == ViewUse::Attachment && (is_astc(f) || is_bc(f))) return VK_FORMAT_UNDEFINED;
@@ -600,7 +607,18 @@ struct BcPush {
 VkDescriptorSetLayout bc_set = VK_NULL_HANDLE;
 VkPipelineLayout bc_layout = VK_NULL_HANDLE;
 VkPipeline bc_pipe = VK_NULL_HANDLE;
-constexpr uint32_t kBcDim = 2048, kBcLayers = 8;   // the scratch: the largest level a BC3 texture may have
+VkPipeline bc7_pipe = VK_NULL_HANDLE;
+bool bc7_ok = true;   // (false once BC7 is unsupported or its pipeline could not be made: BC3 from then on)
+constexpr uint32_t kBcDim = 2048, kBcLayers = 8;   // the scratch: the largest level a BC texture may have
+/// (hookshot) RX_VK_ASTC_BC7=1: big ASTC textures as BC7 instead of BC3. Both are 8 bits a texel; BC7's mode 6 keeps
+/// the colours' gradients and alpha much better (the encoder is host_shaders/bc7_encoder.comp).
+bool bc7_enabled() {
+    static const bool on = [] {
+        const char* e = getenv("RX_VK_ASTC_BC7");
+        return e && atoi(e) != 0;
+    }();
+    return on && bc7_ok;
+}
 VkImage bc_scratch = VK_NULL_HANDLE;
 VmaAllocation bc_scratch_alloc = nullptr;
 VkImageView bc_scratch_view = VK_NULL_HANDLE;
@@ -677,8 +695,16 @@ bool bc_ready() {
     // (the Developer section's ASTC as RGBA8 row, or RX_VK_ASTC_RGBA8 for a run: no BC3, the AMD texture workaround)
     const char* rgba8 = getenv("RX_VK_ASTC_RGBA8");
     if (!astc_ready() || (rgba8 ? !env_value_off(rgba8) : opts.astc_rgba8 != 0) || !dev.features.textureCompressionBC) return false;
+    bool bc7 = bc7_enabled();
+    VkFormat bc_format = bc7 ? VK_FORMAT_BC7_UNORM_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
     VkFormatProperties fp{};
-    vkGetPhysicalDeviceFormatProperties(dev.physical, VK_FORMAT_BC3_UNORM_BLOCK, &fp);
+    vkGetPhysicalDeviceFormatProperties(dev.physical, bc_format, &fp);
+    if (bc7 && !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
+        // (this GPU has BC but not BC7: the texture is BC3, not RGBA8)
+        bc7 = false, bc7_ok = false;
+        bc_format = VK_FORMAT_BC3_UNORM_BLOCK;
+        vkGetPhysicalDeviceFormatProperties(dev.physical, bc_format, &fp);
+    }
     if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) return false;
     const VkDescriptorSetLayoutBinding b[2] = {
         {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
@@ -695,22 +721,30 @@ bool bc_ready() {
     pi.pushConstantRangeCount = 1;
     pi.pPushConstantRanges = &pr;
     if (vkCreatePipelineLayout(dev.device, &pi, nullptr, &bc_layout) != VK_SUCCESS) return false;
-    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    mi.codeSize = sizeof BC_ENCODER_COMP_SPV;
-    mi.pCode = BC_ENCODER_COMP_SPV;
-    VkShaderModule m = VK_NULL_HANDLE;
-    if (vkCreateShaderModule(dev.device, &mi, nullptr, &m) != VK_SUCCESS) return false;
-    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-    ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    ci.stage.module = m;
-    ci.stage.pName = "main";
-    ci.layout = bc_layout;
-    const VkResult r = vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, &bc_pipe);
-    vkDestroyShaderModule(dev.device, m, nullptr);
-    if (r != VK_SUCCESS) return false;
+    auto make_pipe = [&](const uint32_t* code, size_t bytes, VkPipeline& pipe) {
+        VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        mi.codeSize = bytes;
+        mi.pCode = code;
+        VkShaderModule m = VK_NULL_HANDLE;
+        if (vkCreateShaderModule(dev.device, &mi, nullptr, &m) != VK_SUCCESS) return false;
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = m;
+        ci.stage.pName = "main";
+        ci.layout = bc_layout;
+        const VkResult r = vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, &pipe);
+        vkDestroyShaderModule(dev.device, m, nullptr);
+        return r == VK_SUCCESS;
+    };
+    if (!make_pipe(BC_ENCODER_COMP_SPV, sizeof BC_ENCODER_COMP_SPV, bc_pipe)) return false;
+    if (bc7 && !make_pipe(BC7_ENCODER_COMP_SPV, sizeof BC7_ENCODER_COMP_SPV, bc7_pipe)) {
+        // (the BC7 pipeline could not be made: BC3, not RGBA8. The next bc7_enabled() answers false too, so the encoders
+        // and the textures made from now on take bc_pipe)
+        bc7_ok = false, bc7 = false;
+    }
     state = 1;
-    logf("vk: big ASTC textures are kept as BC3 (re-encoded on the GPU; ASTC as RGBA8 or RX_VK_ASTC_RGBA8=1: as RGBA8)");
+    logf("vk: big ASTC textures are kept as %s (re-encoded on the GPU; ASTC as RGBA8 or RX_VK_ASTC_RGBA8=1: as RGBA8)", bc7 ? "BC7" : "BC3");
     return true;
 }
 
@@ -748,7 +782,7 @@ void bc_encode_resized(VkCommandBuffer cmd, uint32_t w, uint32_t h, uint32_t ow,
 void bc_encode_into(VkCommandBuffer cmd, uint32_t w, uint32_t h, uint32_t n, Texture& dst, uint32_t level,
                     uint32_t layer, int dx, int dy, VkImageView from = VK_NULL_HANDLE) {
     full_barrier(cmd);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, bc_pipe);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, bc7_enabled() ? bc7_pipe : bc_pipe);
     VkDescriptorImageInfo ii{VK_NULL_HANDLE, from ? from : bc_scratch_view, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorBufferInfo bi{bc_out, 0, VK_WHOLE_SIZE};
     VkWriteDescriptorSet wr[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
@@ -1850,10 +1884,10 @@ bool texture_size_ok(VkImageType type, uint32_t w, uint32_t h, uint32_t z, uint3
     return w <= most && h <= most && z <= lim.maxImageDimension3D && layers <= lim.maxImageArrayLayers &&
            (samples <= 1 || samples == 2 || samples == 4 || samples == 8 || samples == 16);
 }
-/// (hookshot) One level of an image as the texture budget counts it (create): its texels, or for an ASTC image the GPU samples
-/// itself (Intel's) its blocks of bw x bh texels, which are what its 16 bytes a unit are. Counted as texels, those were 16 bytes a
-/// texel, 16 to 144 times their size: a UHD 770 counted 17608 MB of textures against an integrated GPU's 2560 MB budget while
-/// every allocation of the process was 4766 MB, so the budget's eviction ran at every frame (tests/test_native_astc_texture_count.py)
+/// One mip level in texels (bw = bh = 1), or whole blocks for a compressed image.
+/// Round each mip extent up separately: even a 1x1 BC/ASTC level occupies one block.
+/// (Counted as texels, an ASTC image the GPU samples itself was 16 bytes a texel, 16 to 144 times its size, and
+/// BC1/BC4 twice theirs: tests/test_native_astc_texture_count.py)
 uint64_t texture_level_units(uint32_t w, uint32_t h, uint32_t d, uint32_t bw, uint32_t bh) {
     w = std::max(1u, w), h = std::max(1u, h), d = std::max(1u, d), bw = std::max(1u, bw), bh = std::max(1u, bh);
     return (uint64_t)((w + bw - 1) / bw) * ((h + bh - 1) / bh) * d;
@@ -1869,7 +1903,8 @@ bool low_vram_texture_mips() {
         uint64_t used = 0, allowed = 0;
         return vram_usage(&used, &allowed) && allowed && allowed <= (4ull << 30) + (512ull << 20);
     }();
-    return !disabled && small && opts.preset == 1;
+    // (Minimum, or Auto (this PC) at Minimum's tier: its budgets, opts.budget 1)
+    return !disabled && small && (opts.preset == 1 || (opts.preset == kAutoPreset && opts.budget == 1));
 }
 
 Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw, int bh, int bpb, bool as_target) {
@@ -1910,11 +1945,13 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
         static const char* dim_env = getenv("RX_VK_TEX_MAX_DIM");
         const uint32_t max_dim = dim_env ? (uint32_t)atoi(dim_env) : small_mips ? 1024 : 2048;
         static const uint64_t max_bytes = (uint64_t)(getenv("RX_VK_TEX_MAX_MB") ? atoi(getenv("RX_VK_TEX_MAX_MB")) : 1536) << 20;
-        const uint32_t texel = astc ? 4 : std::max(1, bpb / std::max(1, bw * bh));
+        const bool blocks = !astc && (is_bc(x.format) || is_astc(x.format));
+        const uint32_t texel = astc ? 4 : blocks ? bpb : std::max(1, bpb / std::max(1, bw * bh));
         auto bytes_at = [&](uint32_t skip) {
             uint64_t px = 0;
             for (uint32_t l = skip; l < x.levels; l++)
-                px += (uint64_t)std::max(1u, x.width >> l) * std::max(1u, x.height >> l) * std::max(1u, x.depth >> l);
+                px += texture_level_units(x.width >> l, x.height >> l, x.depth >> l,
+                                          blocks ? (uint32_t)bw : 1u, blocks ? (uint32_t)bh : 1u);
             return px * x.layers * texel * std::max(1, d.samples);
         };
         // (decoded ASTC only by size: uncompressed maps may be read at exact texel coordinates, and the GPU may
@@ -2018,7 +2055,7 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
                          n_rgba8, (unsigned long long)mb_saved);
                 x.width = ew, x.height = eh, x.levels = el;
                 x.bc = true, x.bc_resized = resize;
-                x.format = VK_FORMAT_BC3_UNORM_BLOCK;
+                x.format = bc7_enabled() ? VK_FORMAT_BC7_UNORM_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
             } else {
                 n_rgba8++;
                 if (n_rgba8 <= 4 || (n_rgba8 & (n_rgba8 - 1)) == 0)
@@ -2027,7 +2064,7 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
             }
         } else if (bc_candidate && bc_ready()) {
             x.bc = true;
-            x.format = VK_FORMAT_BC3_UNORM_BLOCK;
+            x.format = bc7_enabled() ? VK_FORMAT_BC7_UNORM_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
         }
     }
     const VkFormatProperties fp = format_props(x.format);
@@ -2144,12 +2181,15 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
                  x.levels, (int)x.format, d.format);
         return nullptr;
     }
-    // what it costs: the level chain's texels (an ASTC image the GPU samples itself: its blocks, texture_level_units)
-    const bool astc_blocks = !astc && is_astc(x.format);
+    // what it costs: whole blocks for native BC/ASTC and re-encoded BC3, texels for other images.
+    // Re-encoded BC3 has 4x4, 16-byte blocks, not the source ASTC's block dimensions.
+    const bool blocks = is_bc(x.format) || is_astc(x.format);
+    const uint32_t unit_w = x.bc ? 4u : blocks ? (uint32_t)bw : 1u;
+    const uint32_t unit_h = x.bc ? 4u : blocks ? (uint32_t)bh : 1u;
     uint64_t px = 0;
     for (uint32_t l = 0; l < x.levels; l++)
-        px += texture_level_units(x.width >> l, x.height >> l, x.depth >> l, astc_blocks ? (uint32_t)bw : 1u, astc_blocks ? (uint32_t)bh : 1u);
-    const uint32_t texel = x.bc || is_bc(x.format) ? 1 : astc ? 4 : std::max(1, from ? (from == 3 ? 4 : from == 6 ? 8 : 16) : bpb);
+        px += texture_level_units(x.width >> l, x.height >> l, x.depth >> l, unit_w, unit_h);
+    const uint32_t texel = x.bc ? 16 : astc ? 4 : std::max(1, from ? (from == 3 ? 4 : from == 6 ? 8 : 16) : bpb);
     x.bytes = x.sparse ? 0 : px * x.layers * texel * x.samples;   // (a sparse image's: as its layers are bound)
     // (the budget counts what the allocator gave it: the texels' 8% short of that over a scene's 2000 textures, 3228 MB counted for 3504
     // MB held, and a budget of 4035 MB took 4300. RX_VK_COUNT_BY_ESTIMATE=1: the texels)
@@ -2597,12 +2637,14 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
     {   // (an upload over 15 ms: what it was, 60 of them)
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - up0).count();
         static int slow_logged;
+        if (ms > 15.0) programs_slow_upload(ms, tex->width, tex->height, tex->nvn_format);   // (RX_VK_LOG_PROGRAM_LIFE=1)
         if (ms > 15.0 && slow_logged++ < 60) {
             uint64_t part = 0;
             if (partial) for (const auto& r : dirty) part += r.second - r.first;
             logf("vk: slow upload %.1f ms: #%u %#llx %ux%ux%u x%u levels %u NVN %#x%s%s, %llu of %llu KB%s", ms, tex->id,
                  (unsigned long long)tex->gpu, tex->width, tex->height, tex->depth, tex->layers, tex->levels,
-                 tex->nvn_format, tex->astc ? " ASTC" : "", tex->bc ? " (BC3)" : "",
+                 tex->nvn_format, tex->astc ? " ASTC" : "",
+                 tex->bc ? (linear_twin(tex->format) == VK_FORMAT_BC7_UNORM_BLOCK ? " (BC7)" : " (BC3)") : "",
                  (unsigned long long)((partial ? part : tex->guest_size) >> 10), (unsigned long long)(tex->guest_size >> 10),
                  tex->uploaded ? " again" : "");
         }
@@ -2676,6 +2718,7 @@ VkImageView texture_view(Texture* tex, const nvn_tex* t, const nvn_view* v, VkIm
     const VkFormat f = view_format_of(tex->format, tex->astc, tex->bc, nf, use, force_format);
     if (f == VK_FORMAT_UNDEFINED) return VK_NULL_HANDLE;
     const bool depth = is_depth_format(tex->format);
+
     const uint32_t vl = view_level(v);
     uint32_t level0 = image_level(tex, vl);
     uint32_t nlevels = v && v->set_levels && v->nlevels ? (vl + v->nlevels > tex->skip ? vl + v->nlevels - tex->skip - level0 : 1)
@@ -2981,7 +3024,20 @@ bool readback_begin() {
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     return vkBeginCommandBuffer(rb_cmd, &bi) == VK_SUCCESS;
 }
+/// (hookshot, RX_VK_FRAME_TRACE) The time spent in a read-back's submit and wait for the GPU (the write-backs before an
+/// eviction, a flush to guest memory), and in texture_frame as a whole: neither was in any of the trace's columns. An area
+/// change had frames of 344 and 528 ms with every column near zero, the replay inside the driver in this wait for 317 ms
+std::atomic<int64_t> st_readback_wait_ns{0}, st_texture_frame_ns{0};
+struct TraceTimer {
+    std::atomic<int64_t>& into;
+    const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    ~TraceTimer() {
+        into.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(),
+                       std::memory_order_relaxed);
+    }
+};
 bool readback_submit_wait() {
+    const TraceTimer timed{st_readback_wait_ns};
     VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};   // (the copies' writes, for the host)
     b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
@@ -3019,6 +3075,9 @@ struct Flush {
     VmaAllocation alloc = nullptr;
     void* map = nullptr;
     bool ok = false;
+    bool only_untouched = false;   // (drawn_writeback.h: only into memory still all zero, or holding its own last write-back)
+    bool touched = false;          // (and it was neither, or a guest thread wrote it during the write: the CPU's, nothing written)
+    uint64_t written_hash = 0;     // (and when written: the hash of its memory as the write left it)
 };
 // (cached host memory, which the CPU reads: the sequential-write kind is write-combined, or VRAM behind the BAR, and every read
 // of it by the unswizzle goes over PCIe uncached. RX_VK_FLUSH_UNCACHED=1: as before)
@@ -3026,8 +3085,10 @@ bool flush_uncached() {
     static const bool uncached = env_on("RX_VK_FLUSH_UNCACHED");
     return uncached;
 }
-/// The copies of f's image into a staging buffer of its own, recorded into rb_cmd (begun by the caller); false: nothing recorded
-bool flush_record(Flush& f) {
+/// The copies of f's image into a staging buffer of its own, recorded into cmd (rb_cmd, begun by the caller, when none is
+/// given); false: nothing recorded
+bool flush_record(Flush& f, VkCommandBuffer cmd = VK_NULL_HANDLE) {
+    if (!cmd) cmd = rb_cmd;
     Texture& t = *f.t;
     const uint32_t layers = t.type == VK_IMAGE_TYPE_3D ? 1 : t.layers;
     for (uint32_t level = 0; level < t.levels; level++) {
@@ -3055,8 +3116,28 @@ bool flush_record(Flush& f) {
         r.imageExtent = {p.g.w, p.g.h, p.g.d};
         c.push_back(r);
     }
-    vkCmdCopyImageToBuffer(rb_cmd, t.image, VK_IMAGE_LAYOUT_GENERAL, f.buf, (uint32_t)c.size(), c.data());
+    vkCmdCopyImageToBuffer(cmd, t.image, VK_IMAGE_LAYOUT_GENERAL, f.buf, (uint32_t)c.size(), c.data());
     return f.ok = true;
+}
+/// [gpu, gpu + n) of guest memory from `from` to `to`, only where it still holds `from` (drawn_writeback::swap_words; went
+/// and only as there, n bytes each): false when a guest thread wrote some of it meanwhile, or it is not mapped
+bool guest_swap(uint64_t gpu, const uint8_t* from, const uint8_t* to, uint64_t n, uint8_t* went = nullptr,
+                const uint8_t* only = nullptr) {
+    bool all = true;
+    for (uint64_t at = 0; at < n;) {
+        uint64_t avail = 0;
+        uint8_t* p = host->gpu_ptr(gpu + at, &avail);
+        if (!p || !avail) {
+            all = false;
+            break;
+        }
+        const uint64_t k = std::min(avail, n - at);
+        all &= drawn_writeback::swap_words(p, from + at, to + at, (size_t)k, went ? went + at : nullptr, only ? only + at : nullptr) == 0;
+        host->mark_written(p, k);   // (as host->gpu_write does: the soft write watch)
+        at += k;
+    }
+    guest_cpu_wrote(gpu, n);
+    return all;
 }
 /// The CPU half, once the batch's read-back completed (gpu_ok) or failed: the texels into the texture's memory, the buffer freed
 bool flush_finish(Flush& f, bool gpu_ok) {
@@ -3067,6 +3148,16 @@ bool flush_finish(Flush& f, bool gpu_ok) {
     void* map = f.map;
     bool ok = f.ok && gpu_ok;
     if (ok && !flush_uncached()) invalidate_mapped(f.alloc, total);
+    // (only_untouched: the memory as it is now, whatever the page generations know of it yet. The texels are staged
+    // against this snapshot and go in at the end, compared with it word by word: publish below)
+    std::vector<uint8_t> was, staged;
+    struct Piece { uint64_t gpu, at, n; };   // (staged[at, at + n) for guest memory at gpu)
+    std::vector<Piece> pieces;
+    if (ok && f.only_untouched) {
+        was.resize((size_t)t.guest_size);
+        if (!host->gpu_read(t.gpu, was.data(), was.size()) || !drawn_writeback::may_write(was.data(), was.size(), t.written_back_hash))
+            ok = false, f.touched = true;
+    }
     if (ok && total <= 64) {   // (RX_VK_LOG_TINY_FLUSH=1: the values of tiny ones, 400 lines: a 1 x 1 luminance)
         static const bool log_tiny = env_on("RX_VK_LOG_TINY_FLUSH");
         static int logged;
@@ -3094,17 +3185,46 @@ bool flush_finish(Flush& f, bool gpu_ok) {
         const uint8_t* src = whole_src + (from - whole_gpu);
         const uint64_t lo = gpu - t.gpu, hi = lo + n;
         bool w = true;
+        const auto put = [&](uint64_t off, const uint8_t* bytes, uint64_t len) {
+            if (!f.only_untouched) return guest_cpu_write(t.gpu + off, bytes, len) != 0;
+            pieces.push_back({t.gpu + off, staged.size(), len});
+            staged.insert(staged.end(), bytes, bytes + len);
+            return true;
+        };
         uint64_t at = lo;
         for (const auto& [a, b] : cpu_runs) {
             if (b <= at) continue;
             if (a >= hi) break;
-            if (a > at) w &= guest_cpu_write(t.gpu + at, src + (at - lo), a - at) != 0;
+            if (a > at) w &= put(at, src + (at - lo), a - at);
             kept_cpu += std::min(b, hi) - std::max(a, at);
             at = std::max(at, b);
             if (at >= hi) break;
         }
-        if (at < hi) w &= guest_cpu_write(t.gpu + at, src + (at - lo), hi - at) != 0;
+        if (at < hi) w &= put(at, src + (at - lo), hi - at);
         return w;
+    };
+    // (only_untouched) the staged texels into memory: the snapshot once more, since the unswizzle took its time, then
+    // each word only where it still is as the snapshot has it. A word a guest thread wrote meanwhile stays, and then
+    // the words that did go in (those only) come out again: either all of the texture's texels are in its memory, or
+    // the memory is as the guest has it
+    const auto publish = [&] {
+        if (!ok || !f.only_untouched) return;
+        std::vector<uint8_t> again(was.size());
+        bool same = host->gpu_read(t.gpu, again.data(), again.size()) && again == was;
+        if (same) {
+            std::vector<uint8_t> went(staged.size());   // (the bytes that went in: the undo takes out those only)
+            for (const Piece& p : pieces)
+                same &= guest_swap(p.gpu, was.data() + (p.gpu - t.gpu), staged.data() + p.at, p.n, went.data() + p.at);
+            if (!same)
+                for (const Piece& p : pieces)
+                    guest_swap(p.gpu, staged.data() + p.at, was.data() + (p.gpu - t.gpu), p.n, nullptr, went.data() + p.at);
+        }
+        if (!same) {
+            ok = false, f.touched = true;
+            return;
+        }
+        for (const Piece& p : pieces) std::memcpy(again.data() + (p.gpu - t.gpu), staged.data() + p.at, (size_t)p.n);
+        f.written_hash = drawn_writeback::hash(again.data(), again.size());
     };
     const auto log_kept = [&] {
         static int logged;
@@ -3123,6 +3243,7 @@ bool flush_finish(Flush& f, bool gpu_ok) {
                 if (!write_back(t.gpu + off, (const uint8_t*)map + p.at + (uint64_t)y * row, row)) ok = false;
             }
         }
+        publish();
         log_kept();
         if (f.buf) destroy_buffer(f.buf, f.alloc);
         return ok;
@@ -3134,12 +3255,15 @@ bool flush_finish(Flush& f, bool gpu_ok) {
             if (p.g.offset + (uint64_t)p.layer * t.L.layer_size >= t.guest_size) continue;
             const uint64_t span = std::min<uint64_t>(p.g.swizzled, t.guest_size - p.g.offset - (uint64_t)p.layer * t.L.layer_size);
             sw.assign(std::max<uint64_t>(p.g.swizzled, span), 0);
-            host->gpu_read(at, sw.data(), span);   // (what is there: the padding between texels kept)
+            // (what is there: the padding between texels kept)
+            if (f.only_untouched) std::memcpy(sw.data(), was.data() + (at - t.gpu), (size_t)span);
+            else host->gpu_read(at, sw.data(), span);
             Tegra::Texture::SwizzleTexture(std::span<uint8_t>(sw.data(), sw.size()),
                                            std::span<const uint8_t>((const uint8_t*)map + p.at, p.n), (u32)t.bpb, p.g.tw,
                                            p.g.th, p.g.td, p.g.tile_h, p.g.tile_d, 1);
             if (!write_back(at, sw.data(), span)) ok = false;   // (marks the pages written: textures over them upload)
         }
+        publish();
         log_kept();
     }
     if (f.buf) destroy_buffer(f.buf, f.alloc);
@@ -3179,6 +3303,157 @@ bool flush_texture(Texture& t, uint64_t clip_lo, uint64_t clip_hi) {
     one.push_back(Flush{&t, clip_lo, clip_hi});
     flush_textures(one);
     return one[0].ok;
+}
+// (hookshot) Small mip-chained textures the GPU drew in one frame: their texels into their memory, from two frames later
+// (drawn_writeback.h has the rule and why: OoT copies a drawn terrain tile's memory on the CPU, and the copy was all
+// zero). Nothing waits for the GPU: a frame's batch has its copies recorded with the present's uploads, and a later
+// frame writes the texels once the GPU is past that recording (a wait here took the frame 3 to 8 ms, and 232 ms behind
+// an area load's uploads). RX_VK_NO_DRAWN_WRITEBACK=1: as before
+std::mutex drawn_mu;
+std::vector<std::pair<uint64_t, Texture*>> drawn_noted;   // (storage, texture: drawn_mu)
+struct DrawnBatch {
+    uint64_t value;   // (the recording its copies are in)
+    uint64_t frame;
+    std::vector<Flush> fs;
+    struct Was { uint32_t id; uint64_t last_written; };   // (each texture as it was then: the same one, not drawn since)
+    std::vector<Was> was;
+};
+std::deque<DrawnBatch> drawn_batches;
+constexpr size_t kDrawnBatches = 4;   // (open at once: with the GPU that far behind, the textures due wait)
+bool drawn_writeback_on() {
+    static const bool on = !env_on("RX_VK_NO_DRAWN_WRITEBACK");
+    return on;
+}
+void drawn_writeback_note(Texture* tex) {
+    if (tex->writeback_noted || !drawn_writeback_on() || !drawn_writeback::noted(tex->gpu, tex->guest_size, tex->levels)) return;
+    tex->writeback_noted = true;
+    std::lock_guard lk(drawn_mu);
+    drawn_noted.push_back({tex->gpu, tex});
+}
+bool drawn_alive(uint64_t gpu, const Texture* t) {   // (not destroyed since it was listed)
+    auto [a, b] = by_gpu.equal_range(gpu);
+    for (auto it = a; it != b; ++it)
+        if (it->second == t) return true;
+    return false;
+}
+/// For each texture (nullptr: skipped), the newest drawing into another image whose storage overlaps its own; 0 for none
+std::vector<uint64_t> drawn_others(const std::vector<const Texture*>& ts) {
+    std::vector<uint64_t> other(ts.size(), 0);
+    for (const auto& kv : textures) {   // (from any start: a scratch heap's targets overlap at other offsets)
+        const Texture* o = kv.second.get();
+        if (!o->gpu_written || !o->guest_size) continue;
+        for (size_t i = 0; i < ts.size(); i++) {
+            const Texture* t = ts[i];
+            if (t && o != t && o->gpu < t->gpu + t->guest_size && o->gpu + o->guest_size > t->gpu)
+                other[i] = std::max(other[i], o->last_written);
+        }
+    }
+    return other;
+}
+/// The batches the GPU is done copying: their texels into memory, where the texture is still as it was copied
+void drawn_writeback_finish() {
+    static int64_t batches, done, failed, left_cpu, dropped, bytes;
+    static double all_ms;
+    while (!drawn_batches.empty() && drawn_batches.front().value <= completed_value) {
+        DrawnBatch batch = std::move(drawn_batches.front());
+        drawn_batches.pop_front();
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<const Texture*> ts;
+        for (size_t i = 0; i < batch.fs.size(); i++) {
+            const Texture* t = batch.fs[i].t;   // (clip_lo is its storage: the pointer is looked at only once found there)
+            ts.push_back(drawn_alive(batch.fs[i].clip_lo, t) && t->id == batch.was[i].id ? t : nullptr);
+        }
+        const std::vector<uint64_t> other = drawn_others(ts);
+        int64_t wrote = 0;
+        const Texture* first = nullptr;
+        for (size_t i = 0; i < batch.fs.size(); i++) {
+            Flush& f = batch.fs[i];
+            // (drawn or uploaded over since the copy, or another image drawn over its storage: the copy is not its content)
+            if (!ts[i] || !f.t->gpu_written || f.t->only_cleared || f.t->last_written != batch.was[i].last_written ||
+                (other[i] && other[i] >= f.t->last_written)) {
+                if (f.buf) destroy_buffer(f.buf, f.alloc);
+                dropped++;
+                continue;
+            }
+            f.ok = flush_finish(f, true);
+            f.t->written_back_for = f.t->last_written;   // (written, or the CPU's memory now: not tried again for this drawing)
+            if (!f.ok) {
+                (f.touched ? left_cpu : failed)++;
+                continue;
+            }
+            done++, wrote++, bytes += (int64_t)f.t->guest_size;
+            f.t->written_back_hash = f.written_hash;   // (its own texels there, for the next drawing's write-back)
+            if (!first) first = f.t;
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        all_ms += ms;
+        if (batches++ < 12 || batches % 200 == 0)
+            logf("vk: %lld of %zu small textures the GPU drew written into their memory in %.1f ms, %llu frames after their copies "
+                 "were recorded, the first #%u %#llx %ux%u levels %u NVN %#x (%lld so far, %lld KB, %.0f ms; %lld left, the CPU wrote "
+                 "their memory since; %lld dropped, drawn over or gone; %lld failed)", (long long)wrote, batch.fs.size(), ms,
+                 (unsigned long long)(frame_no - batch.frame), first ? first->id : 0, (unsigned long long)(first ? first->gpu : 0),
+                 first ? first->width : 0, first ? first->height : 0, first ? first->levels : 0, first ? first->nvn_format : 0,
+                 (long long)done, (long long)(bytes >> 10), all_ms, (long long)left_cpu, (long long)dropped, (long long)failed);
+    }
+}
+void drawn_writeback_frame() {
+    drawn_writeback_finish();
+    if (drawn_batches.size() >= kDrawnBatches) return;
+    std::vector<std::pair<uint64_t, Texture*>> noted;
+    {
+        std::lock_guard lk(drawn_mu);
+        noted.swap(drawn_noted);
+    }
+    if (noted.empty()) return;
+    std::vector<std::pair<uint64_t, Texture*>> wait, cands;
+    std::vector<const Texture*> ts;
+    for (const auto& e : noted)
+        if (drawn_alive(e.first, e.second)) cands.push_back(e), ts.push_back(e.second);
+    const std::vector<uint64_t> other = drawn_others(ts);
+    DrawnBatch batch{rec_value, frame_no, {}, {}};
+    for (size_t i = 0; i < cands.size(); i++) {
+        Texture* t = cands[i].second;
+        const drawn_writeback::When when = drawn_writeback::due(frame_no, t->first_written, t->last_written, t->written_back_for,
+                                                                t->gpu_written, t->only_cleared, other[i]);
+        if (when == drawn_writeback::When::Wait) {
+            wait.push_back(cands[i]);
+            continue;
+        }
+        t->writeback_noted = false;
+        if (when == drawn_writeback::When::Now && flushable(*t)) {
+            Flush f{t, t->gpu, t->gpu + t->guest_size};
+            f.only_untouched = true;
+            batch.fs.push_back(std::move(f));
+        }
+    }
+    if (!wait.empty()) {
+        std::lock_guard lk(drawn_mu);
+        drawn_noted.insert(drawn_noted.end(), wait.begin(), wait.end());
+    }
+    if (batch.fs.empty()) return;
+    // (the copies, in this present's recording with its uploads, as the compaction's are: the drawings are two frames
+    // back, in recordings before it)
+    VkCommandBuffer cmd = upload_cmd();
+    full_barrier(cmd, "drawn write-back: before the copies");
+    std::vector<Flush> recorded;
+    for (Flush& f : batch.fs) {
+        if (!flush_record(f, cmd)) continue;   // (no staging memory: its texels stay out of memory, as before this)
+        f.t->last_value = std::max(f.t->last_value, rec_value);   // (its end, if it goes now, waits for the copy too)
+        batch.was.push_back({f.t->id, f.t->last_written});
+        recorded.push_back(std::move(f));
+    }
+    batch.fs = std::move(recorded);
+    if (batch.fs.empty()) return;
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};   // (the copies' writes, for the host)
+    b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    b.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+    b.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    d.memoryBarrierCount = 1;
+    d.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &d);
+    drawn_batches.push_back(std::move(batch));
 }
 } // namespace
 
@@ -3265,7 +3540,7 @@ void texture_written(Texture* tex, const char* why) {
         if (logged++ < 20) logf("vk: sparse texture %#llx written by the GPU (#%u)", (unsigned long long)tex->gpu, tex->id);
     }
     watch_tex(tex, "written");
-    if (!tex->gpu_written || tex->released) tex->first_written = frame_no;
+    if (!tex->gpu_written || tex->released) tex->first_written = frame_no, drawn_writeback_note(tex);
     tex->last_written = frame_no;
     tex->gpu_written = true;
     tex->gpu_gen = memory_generation();
@@ -3664,9 +3939,9 @@ void compact_step(uint64_t completed) {
         if (frame_no < compact.next_check) return;
         compact.next_check = frame_no + 120;
         static const uint64_t min_free = (uint64_t)(getenv("RX_VK_COMPACT_MB") ? std::max(1, atoi(getenv("RX_VK_COMPACT_MB"))) : 512) << 20;
-        uint64_t block_bytes = 0, free_bytes = 0;
-        if (!textures_pool_usage(&block_bytes, &free_bytes) ||
-            free_bytes < vram_compact::run_from(min_free, compact.pressed))
+        uint64_t block_bytes = 0, free_bytes = 0, kept = 0;   // (kept: the blocks made at the start, which no run gives back)
+        if (!textures_pool_usage(&block_bytes, &free_bytes, &kept) ||
+            vram_compact::returnable(block_bytes, free_bytes, kept) < vram_compact::run_from(min_free, compact.pressed))
             return;
         if (!image_compact_begin(64ull << 20, 12)) return;
         compact.runs++, compact.moved = compact.moved_bytes = compact.ignored = compact.passes = 0;
@@ -3799,7 +4074,11 @@ uint64_t preset_texture_budget(uint64_t preset_mb, bool preset_applies, bool vra
     return integrated ? std::min(b, own) : b;
 }
 
+int64_t texture_readback_wait_ns() { return st_readback_wait_ns.load(std::memory_order_relaxed); }
+int64_t texture_frame_ns() { return st_texture_frame_ns.load(std::memory_order_relaxed); }
+
 void texture_frame(uint64_t completed) {
+    const TraceTimer timed{st_texture_frame_ns};   // (hookshot: the frame trace's tex_frame_ms)
     upload_frame_report();
     frame_upload_ns.store(0, std::memory_order_relaxed);
     if (const int64_t d = st_deferred_frame.exchange(0, std::memory_order_relaxed)) {
@@ -3813,6 +4092,7 @@ void texture_frame(uint64_t completed) {
     }
     completed_value = completed;
     frame_no++;
+    drawn_writeback_frame();
     {   // (staging arenas the GPU is done with, beyond 256 MB of them, and any over 64 MB: freed. A scene change stages
         // hundreds of MB to over a GB (the course maps, the terrain's ASTC arrays), and that host memory was kept)
         // (hookshot: 64 on a card of 6 GB or less. On one with resizable BAR the arenas are VRAM: VMA puts a host-visible buffer the GPU
@@ -3914,13 +4194,71 @@ void texture_frame(uint64_t completed) {
     // in Hyrule Field, so 70% (5.1 GB of an 8 GB card's 7.3) put the whole past what the card holds. The driver paged VRAM to system
     // memory and the GPU time went from ~13 to 55 ms a frame for good: an RTX 3060 Ti at 14 fps ten seconds into play, #1400's
     // RTX 4050 at 5 fps. RX_VK_VRAM_MB=<MB>: the old size, or any)
-    {   // (hookshot) an integrated GPU's "VRAM" is the system's RAM, which the game's own ~10 GB also needs: 70% of what the driver allows
-        // was 5.3 GB of textures on a 16 GB laptop with a Radeon 780M, and the PC ran out of memory in Hyrule Field within minutes
-        // (Discord, 2026-11-09). At most 2.5 GB there unless RX_VK_VRAM_MB says otherwise
+    {   // (hookshot) an integrated GPU's "VRAM" is the system's RAM, dynamically calculated based on system RAM
         static bool told;
-        if (!getenv("RX_VK_VRAM_MB") && dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU && own > (2560ull << 20)) {
-            own = 2560ull << 20;
-            if (!told) told = true, logf("vk: an integrated GPU shares the system's RAM: textures at most 2560 MB (RX_VK_VRAM_MB=<MB>: other)");
+        if (!getenv("RX_VK_VRAM_MB") && dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+            // Get system RAM
+            uint64_t system_ram = 0;
+#if defined(_WIN32)
+            MEMORYSTATUSEX mem_info{sizeof(MEMORYSTATUSEX)};
+            if (GlobalMemoryStatusEx(&mem_info)) {
+                system_ram = mem_info.ullTotalPhys;
+            }
+#else
+            // Linux: read from /proc/meminfo
+            FILE* f = fopen("/proc/meminfo", "r");
+            if (f) {
+                char line[256];
+                while (fgets(line, sizeof(line), f)) {
+                    if (sscanf(line, "MemTotal: %llu kB", (unsigned long long*)&system_ram) == 1) {
+                        system_ram *= 1024;
+                        break;
+                    }
+                }
+                fclose(f);
+            }
+#endif
+            if (system_ram == 0) system_ram = 8ull << 30;  // 8 GB fallback
+
+            // Reserve memory for non-texture usage:
+            // - Game's own allocations (~10 GB for Switch 2 games)
+            // - Render targets, buffers, pipelines (~3-4 GB)
+            // - OS and other apps (~2-4 GB)
+            // - Driver overhead
+            uint64_t reserved = std::min<uint64_t>(system_ram / 3, 16ull << 30);
+            if (reserved < 8ull << 30) reserved = 8ull << 30;
+
+            uint64_t available = system_ram > reserved ? system_ram - reserved : 0;
+            uint64_t driver_budget = own;  // 'own' already has the 70% calculation applied
+            uint64_t budget = std::min(available, driver_budget);
+
+            // Hard caps based on system RAM
+            if (system_ram <= 8ull << 30) {
+                budget = std::min<uint64_t>(budget, 1536ull << 20);   // 1.5 GB
+            } else if (system_ram <= 12ull << 30) {
+                budget = std::min<uint64_t>(budget, 2048ull << 20);   // 2 GB
+            } else if (system_ram <= 16ull << 30) {
+                budget = std::min<uint64_t>(budget, 2560ull << 20);   // 2.5 GB (previous default)
+            } else if (system_ram <= 24ull << 30) {
+                budget = std::min<uint64_t>(budget, 3584ull << 20);   // 3.5 GB
+            } else if (system_ram <= 32ull << 30) {
+                budget = std::min<uint64_t>(budget, 4096ull << 20);   // 4 GB
+            } else {
+                budget = std::min<uint64_t>(budget, 6144ull << 20);   // 6 GB (dGPU max)
+            }
+
+            budget = std::max<uint64_t>(budget, 1024ull << 20);  // Minimum 1 GB
+            budget = std::min(budget, driver_budget);  // Don't exceed driver's limit
+            own = budget;
+
+            if (!told) {
+                told = true;
+                logf("vk: integrated GPU texture budget: %llu MB (system RAM %llu GB, driver allows %llu MB, reserved %llu GB)",
+                     (unsigned long long)(own >> 20),
+                     (unsigned long long)(system_ram >> 30),
+                     (unsigned long long)(driver_budget >> 20),
+                     (unsigned long long)(reserved >> 30));
+            }
         }
     }
     // (a smaller preset on a bigger card: the card's own; RX_VK_VRAM_MB and an integrated GPU's cap: preset_texture_budget)
@@ -3944,13 +4282,16 @@ void texture_frame(uint64_t completed) {
     uint64_t hold_to = 0;    // (and what the hold's own line asks for, when the reserve's lower line set evict_to)
     // (hookshot, RX_VK_COMPACT) compacted, only the textures' pool's free space comes off the count: vram_compact.h
     uint64_t reclaim = block_free;
+    bool kept_only = false;   // (the textures' pool is down to its blocks made at the start: the 97% rule, below)
     if (compact_on()) {
-        uint64_t pool_blocks = 0, pool_free = 0;
-        if (textures_pool_usage(&pool_blocks, &pool_free)) reclaim = vram_compact::reclaimable(block_free, pool_free);
+        uint64_t pool_blocks = 0, pool_free = 0, pool_kept = 0;
+        if (textures_pool_usage(&pool_blocks, &pool_free, &pool_kept)) reclaim = vram_compact::reclaimable(block_free, pool_free);
+        kept_only = vram_compact::kept_only(pool_blocks, pool_kept);
     }
     const uint64_t pressure = by_blocks ? used : used - std::min(used, reclaim);
     pool_pressed = known && pressure > allowed / 10 * 9;   // (the target pool given back meanwhile)
     compact.pressed = known && vram_compact::pressed(used, allowed);   // (hookshot, RX_VK_COMPACT: by the driver's own count)
+    const uint64_t size_budget = budget;   // (the budget as a size, before the rules that take an excess off it: rule_target)
     if (known && pressure > allowed / 10 * 9) {
         const uint64_t over = pressure - allowed / 10 * 9;
         budget = std::min(budget, total_bytes > over ? total_bytes - over : 0);
@@ -3982,15 +4323,24 @@ void texture_frame(uint64_t completed) {
     // not grow, and what this evicts frees space inside the blocks that the count keeps. Ten frames later it squeezed again: a
     // ratchet. On a 4 GB RX 5500M (3337 MB used of 3337, 1224 MB free in the blocks) a paused game, whose scene draws nothing,
     // lost 1700 MB of textures in seconds, made again on unpausing (the long wait), and the HUD's drawn textures went with them.
-    // RX_VK_SQUEEZE_ALWAYS=1: as before
+    // But only while the count is within the allowance: past it the driver pages VRAM out to system memory, whatever room the
+    // blocks hold (#2156: an RTX 5050 8 GB at 7602 MB used of 6982 allowed, 1649 MB free in the blocks, paged 4.5 GB and ran at
+    // 14-25 fps; v2.0.14, without this wait, squeezed there. Ported from Revens2's a4c7cb3). RX_VK_SQUEEZE_ALWAYS=1: as before
     static const bool squeeze_always = env_on("RX_VK_SQUEEZE_ALWAYS");
-    const bool room_in_blocks = !squeeze_always && block_free >= allowed / 8;
-    if (known && !by_blocks && used > allowed / 100 * 97 && !room_in_blocks) {
+    const bool room_in_blocks = !squeeze_always && used <= allowed && block_free >= allowed / 8;
+    // (nor while the textures' pool is down to its blocks made at the start, which VMA keeps: what this evicts would leave the
+    // count as it is, the same ratchet, past the allowance too: there no eviction can bring the count down (#2711).
+    // RX_VK_SQUEEZE_ALWAYS=1 squeezes there too)
+    if (known && !by_blocks && !(kept_only && !squeeze_always) && used > allowed / 100 * 97 && !room_in_blocks) {
         const uint64_t over = used - allowed / 100 * 97;
         budget = std::min(budget, total_bytes > over ? total_bytes - over : 0);
         rule_budget = std::min(rule_budget, total_bytes > over ? total_bytes - over : 0);
     }
-    const uint64_t rule_to = vram_compact::rule_target(total_bytes, rule_budget);
+    // (hookshot) the 90% rule and the driver's limit let go of their excess, not of an eighth of the cache: vram_compact.h.
+    // RX_VK_EVICT_EXCESS=0: to 7/8 of their budget, as before
+    static const bool excess_only = !getenv("RX_VK_EVICT_EXCESS") || atoi(getenv("RX_VK_EVICT_EXCESS")) != 0;
+    const uint64_t rule_to = excess_only ? vram_compact::rule_target(total_bytes, size_budget, rule_budget)
+                                         : vram_compact::rule_target(total_bytes, rule_budget);
     // (hookshot, RX_VK_COMPACT: the driver's limit asks for more than the reserve does: a pass over the budget, to 7/8 of it, as
     // before. Rare once the reserve is set: its line is 17 points under the limit's and counts the textures' free space out, so
     // this takes more than that share of the allowance free in their pool. Otherwise the pass is the hold's, and what the

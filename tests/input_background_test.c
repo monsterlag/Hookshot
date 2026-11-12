@@ -28,7 +28,18 @@ LONG64 InterlockedCompareExchange64(volatile LONG64 *p, LONG64 value, LONG64 exp
     return old;
 }
 static int64_t now_ns = 10000000000LL, sampling;
+typedef long LONG;   /* (the note layer's words: production gets it from windows.h) */
 static int key_bind[HOS_KEY_N][2], pad_raw_now;   /* (the keys-only controls after the Switch's buttons) */
+typedef int SRWLOCK;   /* (host/nn_hid.c guards the pad table with these since #1990) */
+#define SRWLOCK_INIT 0
+static void AcquireSRWLockShared(SRWLOCK *p) { (void)p; }
+static void ReleaseSRWLockShared(SRWLOCK *p) { (void)p; }
+static int pad_bind[HOS_KEY_N][2];   /* (the ocarina note layer reads it; hos_oc_wait stays 0, so nothing is consumed) */
+static SRWLOCK pad_bind_lock = SRWLOCK_INIT;
+static int pad_after_menu;
+static LONG oc_consumed_keys[256];
+static uint64_t oc_consumed_pads;
+volatile uint64_t hos_oc_note_bits; volatile int hos_oc_wait; volatile int hos_oc_last_kind; volatile unsigned hos_oc_beat;
 static unsigned char *memory;
 static char last_log[256];
 static int origin_logs, script_logs;
@@ -87,6 +98,8 @@ void binds_load(void) {
 /* the native mouse look (no camera found: the motion goes to mouse_stick) and the mouse's sensitivity, which
    read_input calls */
 int hos_mouse_native(void) { return -1; }
+void hos_mouse_native_free(int free) { (void)free; }
+void hos_mouse_native_stick(int held) { (void)held; }
 static void mouse_setup(void) {}
 static void mouse_sens_keys(void) {}
 int mouse_stick(int32_t *x, int32_t *y, int held) { (void)x; (void)y; (void)held; mouse_queries++; return 0; }
@@ -231,6 +244,7 @@ int main(int argc, char **argv) {
     if (!strcmp(name, "script-background")) CHECK(strstr(last_log, "game window not in front"));
     if (front) CHECK(pad_merges > 0 && key_queries > 0 && mouse_queries > 0);
     CHECK(focus_queries > 0);
+    CHECK(oc_consumed_pads == 0);   /* hos_oc_wait stays 0: the ocarina note layer took no pad button */
     printf("PASS: actual scripted parse/merge/Npad route %s\n", name);
     free(memory);
     return 0;

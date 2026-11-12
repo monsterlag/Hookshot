@@ -99,12 +99,19 @@ def serve(f):
                 r.update(sent=None if req.get("wait") is False else True)
                 if r["sent"]:
                     r.update(map="GerudoFortress_Adult", accepted=req.get("to") != "gerudofortress_adult")
+        elif cmd == "age":   # (Link is the child here: to the child is nothing to do)
+            if req.get("to") == "child":
+                r.update(age="child", sent=False)
+            else:
+                r.update(age="adult", sent=None if req.get("wait") is False else True)
+                if r["sent"]:
+                    r.update(map="KokiriForest_Adult", accepted=True)
         elif cmd in ("press", "stick", "sequence"):
             r.update(start=frame[0], end=frame[0] + req.get("frames", 8))
         elif cmd == "shot":
             r.update(present=frame[0] + 1, path=req.get("path") or "/run/shots/shot_0001.png")
         elif cmd == "wait":
-            if req.get("event") == "loading_end":
+            if req.get("event") == "loading_end" and req.get("timeout", 60) <= 1:
                 r = {"id": rid, "ok": False, "frame": frame[0], "error": "timeout", "message": "not met in time"}
             else:
                 r.update(state="play", waited=3)
@@ -313,6 +320,23 @@ class HookshotCtl(unittest.TestCase):
         r = ctl("teleport", "refuse", env=self.env, check=1)
         self.assertIn("refused: the game refused the teleport: a map is loading", r.stderr)
         ctl("teleport", "--arrive", "5", env=self.env, check=2)
+        r = ctl("age", env=self.env, check=0)   # (none: the other age, waited for)
+        self.assertEqual(r.stdout.strip(), "age switch sent: the adult, reloading KokiriForest_Adult")
+        self.assertEqual(self.last("age")["timeout"], 10)
+        self.assertNotIn("to", self.last("age"))
+        self.assertNotIn("wait", self.last("age"))
+        r = ctl("age", "child", env=self.env, check=0)
+        self.assertEqual(r.stdout.strip(), "Link is the child already")
+        self.assertEqual(self.last("age")["to"], "child")
+        r = ctl("age", "adult", "--no-wait", env=self.env, check=0)
+        self.assertIn("age switch to the adult asked for", r.stdout)
+        self.assertIs(self.last("age")["wait"], False)
+        # (sent, then the end of the reload's load: in a dungeon the map is the same name for both ages, so not wait map)
+        r = ctl("age", "adult", "--arrive", "30", env=self.env, check=0)
+        self.assertRegex(r.stdout, r"^age switch: the adult, in KokiriForest_Adult after 3 frames")
+        self.assertEqual((self.last("wait")["event"], self.last("wait")["timeout"]), ("loading_end", 30))
+        self.assertNotIn("map", self.last("wait"))
+        ctl("age", "teen", env=self.env, check=2)   # (argparse: child or adult only)
         r = ctl("option", "set", "nope", "1", env=self.env, check=1)
         self.assertIn("not_found", r.stderr)
         r = ctl("raw", '{"cmd":"fly"}', env=self.env, check=1)

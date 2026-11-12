@@ -141,6 +141,20 @@ static uint64_t host_guest_alloc(uint64_t size) {
 void hos_watch_guest_writes(const uint8_t *data, uint64_t size);   /* nvn_native.c */
 static void host_watch_guest_writes(uint64_t guest, uint64_t size) { hos_watch_guest_writes(hos_guest_base() + guest, size); }
 static float host_aspect_ratio(void) { return hos_aspect_ratio; }
+#ifndef _WIN32
+int hos_sdl_desktop_size(int *width, int *height);   /* hos_sdl.c */
+#endif
+/* (hookshot) the main screen's size, as host/hos_main.c takes its shape (MkwVkHost.screen_size) */
+static int host_screen_size(int *width, int *height) {
+#ifdef _WIN32
+    const int w = GetSystemMetrics(SM_CXSCREEN), h = GetSystemMetrics(SM_CYSCREEN);
+    if (w <= 0 || h <= 0) return 0;
+    *width = w, *height = h;
+    return 1;
+#else
+    return hos_sdl_desktop_size(width, height);
+#endif
+}
 static float host_wide_menus(uint32_t keep_mask) {   /* (MkwVkHost.wide_menus) */
     extern volatile uint32_t hos_wide_keep_mask;
     extern volatile float hos_wide_margin;
@@ -186,7 +200,7 @@ static const MkwVkHost vk_host = {
     hos_gpu_maps_generation, nvn_vmap_generation, hos_reserved_cpus, host_collect_in, host_guest_alloc,
     host_watch_guest_writes, hos_pad_raw, hos_binding, hos_bind, host_aspect_ratio, host_take_key_press,
     hos_mouse_pointer, hos_mic_count, hos_mic_name, hos_mic_select, hos_sdl_gyro_status, hos_log_flush, hos_prompts_face,
-    host_romfs_dir, host_wide_menus, host_slept_ns, host_fps_timing, hos_prompts_live_parts,
+    host_romfs_dir, host_wide_menus, host_slept_ns, host_fps_timing, hos_prompts_live_parts, host_screen_size,
 };
 
 static const MkwVkRenderer *vk;   /* the Vulkan back end, when it was chosen and started */
@@ -423,6 +437,9 @@ void rx_nvn_texture_created(const nvn_tex *t) {
     if (vk && vk->nvn_texture_created) vk->nvn_texture_created(t);
 }
 void rx_nvn_program_released(const nvn_prog *p) { vk ? vk->nvn_program_released(p) : wgr_nvn_program_released(p); }
+void rx_nvn_program_created(const nvn_prog *p) {
+    if (vk && vk->nvn_program_created) vk->nvn_program_created(p);
+}
 void rx_nvn_read_texels(const nvn_tex *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst,
                         size_t row, size_t img) {
     vk ? vk->nvn_read_texels(t, level, layer0, r, dst, row, img) : wgr_nvn_read_texels(t, level, layer0, r, dst, row, img);

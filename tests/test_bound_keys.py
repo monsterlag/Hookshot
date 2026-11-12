@@ -64,6 +64,11 @@ static void ReleaseSRWLockShared(SRWLOCK *p) { (void)p; }
 #define VK_CONTROL 0x11
 #define VK_MENU 0x12
 #define VK_SPACE 0x20
+#define VK_NUMPAD0 0x60
+#define VK_NUMPAD2 0x62
+#define VK_NUMPAD4 0x64
+#define VK_NUMPAD6 0x66
+#define VK_NUMPAD8 0x68
 #define VK_LEFT 0x25
 #define VK_UP 0x26
 #define VK_RIGHT 0x27

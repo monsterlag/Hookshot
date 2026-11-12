@@ -15,8 +15,13 @@ static inline int hos_output_size_valid(uint32_t w, uint32_t h) {
            (uint64_t)w * 4 >= (uint64_t)h * 5 && (uint64_t)w * 9 <= (uint64_t)h * 48;
 }
 
-static inline int hos_output_is_surround(uint32_t w, uint32_t h) {
-    return h && (uint64_t)w * 9 > (uint64_t)h * 32;
+/* An output size of a shape of its own: more than 1 % off 16:9 (16:10, 4:3, 21:9, 32:9...), as the Insert menu's Aspect ratio
+   row offers them. The picture takes that shape (its cameras and HUD as at the monitor's shape), over HOS_ASPECT and the
+   Aspect ratio's ultrawide=, which then only shape a 16:9 output. The same 1 % as host/hos_main.c's screen ratio. */
+static inline int hos_output_own_shape(uint32_t w, uint32_t h) {
+    if (!w || !h) return 0;
+    const double r = (double)w / (double)h, game = 16.0 / 9.0;
+    return r > game * 1.01 || r < game * 0.99;
 }
 
 /* The screen's ratio as the picture takes it: 5:4 to 48:9. */

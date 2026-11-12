@@ -1167,6 +1167,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
     // (EvilOOT) the structure pointer type of a storage buffer of that member's elements, for OpArrayLength
     const auto struct_pointer_of{[&](DefPtr m) -> Id {
         if (m == &StorageDefinitions::U32) return storage_types.U32.array;
+        if (m == &StorageDefinitions::F32) return storage_types.F32.array;   // (hookshot: the native float add's, as U32's)
         if (m == &StorageDefinitions::U32x2) return storage_types.U32x2.array;
         if (m == &StorageDefinitions::U32x4) return storage_types.U32x4.array;
         return Id{};
@@ -1560,17 +1561,18 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
         write_global_cas_loop_func = func;
     }
     // (hookshot) RED/ATOM.E.ADD.F32 at an address no buffer was tracked to: the 32-bit atomics' fallback, with the float
-    // sum made in a compare-exchange loop as the storage buffers' f32_add_cas does
+    // sum made in a compare-exchange loop as the storage buffers' f32_add_cas does, or the GPU's own float add where
+    // the storage buffers' adds are (native_f32_add: the f32 views, searched as the u32 ones)
     if (info.stores_global_memory) {
         const Id func_type{TypeFunction(F32[1], U64, F32[1])};
         const Id func{OpFunction(F32[1], spv::FunctionControlMask::DontInline, func_type)};
         const Id addr{OpFunctionParameter(U64)};
         const Id value{OpFunctionParameter(F32[1])};
         AddLabel();
-        const Id expected_var{AddLocalVariable(TypePointer(spv::StorageClass::Function, U32[1]),
-                                               spv::StorageClass::Function)};
-        const Id tries_var{AddLocalVariable(TypePointer(spv::StorageClass::Function, U32[1]),
-                                            spv::StorageClass::Function)};
+        const Id expected_var{native_f32_add ? Id{} : AddLocalVariable(TypePointer(spv::StorageClass::Function, U32[1]),
+                                                                       spv::StorageClass::Function)};
+        const Id tries_var{native_f32_add ? Id{} : AddLocalVariable(TypePointer(spv::StorageClass::Function, U32[1]),
+                                                                    spv::StorageClass::Function)};
         const auto cas_loop{[&](Id pointer) {
             OpStore(expected_var, OpLoad(U32[1], pointer, spv::MemoryAccessMask::Aligned, 4U));
             OpStore(tries_var, u32_zero_value);   // (a ceiling of attempts, as every compare-exchange loop has: #548)
@@ -1597,11 +1599,19 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
             AddLabel(continue_label);
             OpBranch(begin_label);
         }};
-        define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2,
-                    [&](Id ssbo_pointer) { cas_loop(ssbo_pointer); }, false);
+        const auto native_add{[&](Id pointer) {
+            OpReturnValue(OpAtomicFAddEXT(F32[1], pointer, Const(static_cast<u32>(spv::Scope::Device)), u32_zero_value, value));
+        }};
+        if (native_f32_add) {
+            define_body(&StorageDefinitions::F32, addr, storage_types.F32.element, 2, native_add, false);
+        } else {
+            define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2,
+                        [&](Id ssbo_pointer) { cas_loop(ssbo_pointer); }, false);
+        }
         if (follow_stores) guest_lookup(addr, 4U, [&](Id target) {
-            if (gp_level >= 3) cas_loop(psb_member(U32[1], target));
-            else OpReturnValue(ConstantNull(F32[1]));
+            if (gp_level < 3) OpReturnValue(ConstantNull(F32[1]));
+            else if (native_f32_add) native_add(psb_member(F32[1], target));
+            else cas_loop(psb_member(U32[1], target));
         });
         OpReturnValue(ConstantNull(F32[1]));
         OpFunctionEnd();
@@ -1870,6 +1880,14 @@ void EmitContext::DefineConstantBufferIndirectFunctions(const Info& info) {
 }
 
 void EmitContext::DefineStorageBuffers(const Info& info, u32& binding) {
+    // (hookshot) RED/ATOM.ADD.F32 as the GPU's own float add where it has one, on an f32 view of the buffer: the
+    // compare-exchange loop gives up after CAS_LOOP_MAX_TRIES attempts, and an add that gives up is lost. Decided before
+    // the early return: DefineGlobalMemoryFunctions' fallback reads it too
+    native_f32_add = profile.support_float32_atomic_add && profile.support_descriptor_aliasing && info.uses_atomic_f32_add;
+    if (native_f32_add) {
+        AddExtension("SPV_EXT_shader_atomic_float_add");
+        AddCapability(spv::Capability::AtomicFloat32AddEXT);
+    }
     if (info.storage_buffers_descriptors.empty()) {
         return;
     }
@@ -1878,6 +1896,9 @@ void EmitContext::DefineStorageBuffers(const Info& info, u32& binding) {
     IR::Type used_types{profile.support_descriptor_aliasing ? info.used_storage_buffer_types
                                                             : IR::Type::U32};
     used_types |= IR::Type::U32;
+    if (native_f32_add) {
+        used_types |= IR::Type::F32;
+    }
     if (profile.support_int8 && profile.support_storage_buffer_8bit &&
         True(used_types & IR::Type::U8)) {
         DefineSsbos(*this, storage_types.U8, &StorageDefinitions::U8, info, binding, U8,
@@ -1930,7 +1951,7 @@ void EmitContext::DefineStorageBuffers(const Info& info, u32& binding) {
         decrement_cas_ssbo = CasLoop(*this, Operation::Decrement, storage_types.U32.array,
                                      storage_types.U32.element, U32[1], spv::Scope::Device);
     }
-    if (info.uses_atomic_f32_add) {
+    if (info.uses_atomic_f32_add && !native_f32_add) {
         f32_add_cas = CasLoop(*this, Operation::FPAdd, storage_types.U32.array,
                               storage_types.U32.element, F32[1], spv::Scope::Device);
     }
@@ -2073,6 +2094,12 @@ void EmitContext::DefineImages(const Info& info, u32& binding, u32& scaling_inde
 void EmitContext::DefineInputs(const IR::Program& program) {
     const Info& info{program.info};
     const VaryingState loads{info.loads.mask | info.passthrough.mask};
+    const bool noperspective_as_smooth{
+        stage == Stage::Fragment && runtime_info.scaled_noperspective_inputs &&
+        std::ranges::any_of(info.interpolation,
+                            [](Interpolation mode) {
+                                return mode == Interpolation::NoPerspective;
+                            })};
 
     if (info.uses_workgroup_id) {
         workgroup_id = DefineInput(*this, U32[3], false, spv::BuiltIn::WorkgroupId);
@@ -2140,7 +2167,8 @@ void EmitContext::DefineInputs(const IR::Program& program) {
         layer = DefineInput(*this, U32[1], false, spv::BuiltIn::Layer);
         Decorate(layer, spv::Decoration::Flat);
     }
-    if (loads.AnyComponent(IR::Attribute::PositionX)) {
+    if (loads.AnyComponent(IR::Attribute::PositionX) ||
+        info.passthrough.AnyComponent(IR::Attribute::PositionX) || noperspective_as_smooth) {
         const bool is_fragment{stage == Stage::Fragment};
         if (!is_fragment && profile.has_broken_spirv_position_input) {
             need_input_position_indirect = true;
@@ -2245,7 +2273,12 @@ void EmitContext::DefineInputs(const IR::Program& program) {
             case Interpolation::Smooth:
                 break;
             case Interpolation::NoPerspective:
-                Decorate(id, spv::Decoration::NoPerspective);
+                // The previous stage may write it times Position.w (noperspective_outputs).
+                if (!runtime_info.scaled_noperspective_inputs) {
+                    Decorate(id, spv::Decoration::NoPerspective);
+                } else {
+                    noperspective_as_smooth_inputs[index] = true;
+                }
                 break;
             case Interpolation::Flat:
                 Decorate(id, spv::Decoration::Flat);

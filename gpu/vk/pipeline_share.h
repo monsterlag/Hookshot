@@ -60,10 +60,26 @@ inline std::string template_lines(const std::vector<std::string>& values) {
 inline std::string report_text(const std::string& lines) {
     return std::string("Attach this zip to a comment on ") + kIssueUrl +
            " and paste the lines below into it, with where you played filled in.\nThe zip holds only " + kListName +
-           " (shader hashes, formats and draw state: no game code, game data or personal info) and this text.\n\n" + lines;
+           " (shader hashes, formats and draw state, and the hashes of the compute programs your play ran: no game code, game data or "
+           "personal info) and this text.\n\n" + lines;
 }
-/// The Pipelines line: the count and the list's version
-inline std::string pipelines_text(long long n, bool v2) { return std::to_string(n) + (v2 ? " (version 2)" : " (version 1)"); }
+/// How many of a checked list's records name a compute program (a version 2 record whose kind, its second last word, is 1:
+/// vk_draw.cpp StateRec2::kCompute, nx2/pipeline_states.py COMPUTE). The list is zipped as it is: they go with the pipelines
+inline long long compute_count(const std::string& bytes) {
+    if (bytes.size() < 12 || bytes.compare(0, 8, "HKSTATE2")) return 0;
+    long long n = 0;
+    for (size_t at = 12; at + 552 <= bytes.size(); at += 552) {
+        uint32_t kind = 0;
+        std::memcpy(&kind, bytes.data() + at + 544, 4);
+        n += kind == 1;
+    }
+    return n;
+}
+/// The Pipelines line: the count and the list's version, and how many of them are compute programs when it names any
+inline std::string pipelines_text(long long n, bool v2, long long computes = 0) {
+    return std::to_string(n) + (v2 ? " (version 2" : " (version 1") +
+           (computes ? ", " + std::to_string(computes) + " of them compute programs)" : ")");
+}
 inline std::string mods_text(const std::vector<std::string>& names) {
     std::string out;
     for (const std::string& n : names) out += (out.empty() ? "" : ", ") + n;

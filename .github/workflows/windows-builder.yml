@@ -7,7 +7,8 @@
 # A workflow artifact on every run; for a release, the new parts go to the builder-parts release and the setup
 # (HookshotBuilder.exe) and its list (hookshot-setup.txt) to the release, beside the Linux AppImage. A release is a tag
 # pushed by hand, or the tag the Release workflow passes when it calls this one (inputs.tag). On any other push to main,
-# the same files replace those of the nightly prerelease, the latest development build.
+# the same files replace those of the nightly prerelease, the latest development build, when its commit comes after the
+# one the nightly holds.
 name: Windows builder
 
 on:
@@ -37,7 +38,8 @@ env:
   RELEASE_TAG: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name || '') }}
 
 concurrency:
-  # (a fixed name: when called, github.workflow is the caller's)
+  # (a fixed name: when called, github.workflow is the caller's. One run of main at a time, and one waiting, replaced by a
+  # newer push's: scripts/release_upload.sh counts on it, so this platform's nightly files never go back)
   group: windows-builder-${{ inputs.tag || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
@@ -48,8 +50,8 @@ defaults:
 jobs:
   package:
     name: Hookshot Builder package and setup
-    # (builder-parts holds the installer's parts: no package there. nightly is moved by the release job of a push to main,
-    # and rc by the Release workflow)
+    # (builder-parts holds the installer's parts: no package there. nightly is moved forward by the release job of a push
+    # to main, here or in the Linux AppImage workflow, and rc by the Release workflow)
     if: github.ref_name != 'builder-parts' && github.ref_name != 'nightly' && github.ref_name != 'rc'
     needs: [dav1d]
     runs-on: windows-2022

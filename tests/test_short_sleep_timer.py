@@ -8,6 +8,10 @@ sleeps (the frame limiter, the audio renderer) still yield and come back at thei
 set, is read by env_on's rule (gpu/vk/compat/hookshot_env.h): on is the timer for every short sleep, off (0, false, off,
 no, empty) is yielding for every one; not set, the processors decide.
 
+Where the game's short sleeps yield (more processors), at most HOS_SHORT_SLEEP_POLLERS of the game's threads (not set: a
+quarter of the processors; 0: no limit; none when HOS_SHORT_SLEEP_TIMER is set) yield through one at the same time; the next waits on the timer until one is back.
+The frame's serial threads (hos_thread_serial) and the host's own sleeps always yield and are not counted.
+
 The fixture runs the real code cut from the source (the choice, hos_sleep_ns, sleep_ns and the game's entry
 hos_sleep_logged) over stubs that count the yields and the timer waits, one process a case (the choice is made once).
 
@@ -23,11 +27,13 @@ from pathlib import Path
 RUN_ALL_ARGS = ["--cc", "gcc"]
 
 ROOT = Path(__file__).resolve().parents[1]
-CHOICE = "enum { SHORT_SLEEP_TIMER_THREADS"
+PROCS = "enum { SHORT_SLEEP_TIMER_THREADS = 6 };"   # (with process_threads: the processors, shared with hos_spin_ns)
+CHOICE = "static int hos_short_sleep_timer(const char *asked, int threads) {"
 AWAY = "static void sleep_away(int64_t ns, int guest) {"
 HOST = "void hos_sleep_ns(int64_t ns) { sleep_away(ns, 0); }\n"
 SLEEP = "static void sleep_ns(int64_t ns, int guest) {"
 GUEST = "void hos_sleep_logged(int64_t ns, uint64_t lr) {"
+POLLERS = "static volatile LONG short_pollers;"
 
 
 def block(source, marker):
@@ -84,6 +90,12 @@ static BOOL GetProcessAffinityMask(HANDLE p, DWORD_PTR *proc, DWORD_PTR *sys) {
     return 1;
 }
 static LONG InterlockedExchange(volatile LONG *p, LONG v) { const LONG old = *p; *p = v; return old; }
+static LONG InterlockedIncrement(volatile LONG *p) { return ++*p; }
+static LONG InterlockedDecrement(volatile LONG *p) { return --*p; }
+typedef struct HosThread HosThread;
+static int serial;   /* (whether the sleeping thread is one of the frame's serial threads) */
+static HosThread *hos_self(void) { return (HosThread *)(uintptr_t)8; }
+static int hos_thread_serial(const HosThread *t) { return t && serial; }
 static void AcquireSRWLockExclusive(SRWLOCK *l) { CHECK(!*l); *l = 1; }
 static void ReleaseSRWLockExclusive(SRWLOCK *l) { CHECK(*l); *l = 0; }
 static HANDLE CreateWaitableTimerExW(void *a, void *n, DWORD flags, DWORD access) {
@@ -107,7 +119,9 @@ static int hos_vcore_away(void) { aways++; return 1; }
 static void hos_vcore_back(void) { backs++; }
 static void sleep_ns(int64_t ns, int guest);
 
+@PROCS@
 @CHOICE@
+@POLLERS@
 @AWAY@
 @HOST@
 @SLEEP@
@@ -127,10 +141,37 @@ static int short_sleep(int guest, int64_t ns) {
     return 1;
 }
 
+/* the limit on the game's threads yielding at once: cap of them may (0: no limit) */
+static void pollers(int cap) {
+    CHECK(short_pollers == 0);
+    if (!cap) {   /* (no limit: however many poll, the game's next short sleep yields) */
+        short_pollers = 1000;
+        CHECK(short_sleep(1, 20000) == 0 && short_pollers == 1000);
+        short_pollers = 0;
+        return;
+    }
+    short_pollers = cap - 1;   /* (room for one more: it yields, and is not counted once back) */
+    CHECK(short_sleep(1, 20000) == 0 && short_pollers == cap - 1);
+    short_pollers = cap;   /* (full: the game's next short sleep waits on the timer, and the count stays) */
+    CHECK(short_sleep(1, 20000) == 1 && short_pollers == cap);
+    CHECK(short_sleep(1, 999999) == 1 && short_pollers == cap);
+    serial = 1;   /* (a serial thread yields all the same, not counted) */
+    CHECK(short_sleep(1, 20000) == 0 && short_pollers == cap);
+    serial = 0;
+    CHECK(short_sleep(0, 20000) == 0 && short_pollers == cap);   /* (the host's own sleeps: as before) */
+    short_pollers = 0;
+    /* (the choice by itself) */
+    CHECK(hos_short_sleep_pollers(NULL, 16) == 4 && hos_short_sleep_pollers(NULL, 8) == 2 && hos_short_sleep_pollers(NULL, 7) == 1);
+    CHECK(hos_short_sleep_pollers(NULL, 6) == 0 && hos_short_sleep_pollers(NULL, 0) == 0 && hos_short_sleep_pollers(NULL, -1) == 0);
+    CHECK(hos_short_sleep_pollers("0", 16) == 0 && hos_short_sleep_pollers("2", 16) == 2 && hos_short_sleep_pollers("3", 4) == 3);
+    CHECK(hos_short_sleep_pollers("-1", 16) == 0 && hos_short_sleep_pollers("x", 16) == 4 && hos_short_sleep_pollers("", 16) == 4);
+}
+
 int main(int argc, char **argv) {
-    CHECK(argc == 3 || argc == 4);
+    CHECK(argc >= 3 && argc <= 5);
     threads = atoi(argv[1]);
-    if (argc == 4) groups = atoi(argv[3]);   /* (processor groups: the mask is then one group's) */
+    if (argc >= 4) groups = atoi(argv[3]);   /* (processor groups: the mask is then one group's) */
+    const int cap = argc == 5 ? atoi(argv[4]) : 0;   /* (the game's threads that may yield at once; 0: no limit) */
     const int how = atoi(argv[2]);   /* 0: all yield, 1: the game's sleeps on the timer, 2: all on the timer */
     CHECK(how >= 0 && how <= 2);
     /* (the choice by itself, at its edge) */
@@ -158,7 +199,8 @@ int main(int argc, char **argv) {
     CHECK(core_yields == 1 && yields == y + 1 && timer_waits == waits && aways == a);
     CHECK(aways == 9 && backs == aways);   /* (every sleep gave its virtual core up and took one back) */
     CHECK(affinity_calls == (groups == 1));   /* (chosen once; with several groups the mask is not asked for) */
-    CHECK(logged == (how ? 1 : 0));   /* (the log says so once where the timer is chosen) */
+    CHECK(logged == (how || cap ? 1 : 0));   /* (the log says so once where the timer or a limit is chosen) */
+    if (how == 0) pollers(cap);
     return 0;
 }
 '''
@@ -176,7 +218,7 @@ def main():
     a = p.parse_args()
 
     src = (ROOT / "host" / "hos_thread.c").read_text(encoding="utf-8")
-    parts = {"@CHOICE@": block(src, CHOICE), "@AWAY@": block(src, AWAY), "@SLEEP@": block(src, SLEEP),
+    parts = {"@PROCS@": block(src, PROCS), "@CHOICE@": block(src, CHOICE), "@POLLERS@": block(src, POLLERS), "@AWAY@": block(src, AWAY), "@SLEEP@": block(src, SLEEP),
              "@GUEST@": block(src, GUEST)}
     check(HOST in src, "host/hos_thread.c has no '%s'" % HOST.strip())
     parts["@HOST@"] = HOST
@@ -196,10 +238,13 @@ def main():
                         str(c), "-o", str(exe)], check=True)
         return exe
 
-    def run(exe, threads, asked, how, groups=1):
+    def run(exe, threads, asked, how, groups=1, cap=None, polled=None):
         e = dict(env) if asked is None else dict(env, HOS_SHORT_SLEEP_TIMER=asked)
-        return subprocess.run([str(exe), str(threads), str(how)] + ([str(groups)] if groups != 1 else []), env=e,
-                              capture_output=True, text=True)
+        if polled is not None:
+            e["HOS_SHORT_SLEEP_POLLERS"] = polled
+        if cap is None:   # (the default limit where the game's short sleeps yield: a quarter of the processors)
+            cap = threads // 4 if how == 0 and groups == 1 and threads > 6 and asked is None else 0
+        return subprocess.run([str(exe), str(threads), str(how), str(groups), str(cap)], env=e, capture_output=True, text=True)
 
     def broken(tmp, name, part, old, new, case, what):
         check(old in parts[part], "%s no longer has the line the broken variant '%s' changes" % (part, name))
@@ -224,6 +269,15 @@ def main():
                   % (asked, how, r.stderr))
         r = run(exe, 4, None, 1, groups=2)
         check(r.returncode != 0 and "FAIL:" in r.stderr, "one group's mask of 4 counts as the process's processors")
+        # the limit on the game's threads yielding at once (HOS_SHORT_SLEEP_POLLERS), where they yield
+        for threads, polled, cap in ((16, None, 4), (8, None, 2), (12, None, 3), (16, "0", 0), (16, "2", 2), (16, "off", 4),
+                                     (64, None, 16), (-1, None, 0), (-1, "2", 2)):
+            r = run(exe, threads, None, 0, cap=cap, polled=polled)
+            check(r.returncode == 0, "%d threads, HOS_SHORT_SLEEP_POLLERS %r: not a limit of %d\n%s" % (threads, polled, cap, r.stderr))
+            r = run(exe, threads, None, 0, cap=cap + 1, polled=polled)
+            check(r.returncode != 0 and "FAIL:" in r.stderr, "%d threads, %r passes as a limit of %d too" % (threads, polled, cap + 1))
+        r = run(exe, 4, None, 1, polled="2")   # (where the game's sleeps wait on the timer, no limit applies)
+        check(r.returncode == 0, "4 threads, HOS_SHORT_SLEEP_POLLERS=2: not the timer as without it\n" + r.stderr)
         # broken variants: each must fail the case it breaks
         broken(tmp, "never", "@CHOICE@", "threads > 0 && threads <= SHORT_SLEEP_TIMER_THREADS ? 1 : 0", "threads < 0 ? 1 : 0",
                (4, None, 1), "all yielding on 4 threads passes: the processors are not looked at")
@@ -235,10 +289,17 @@ def main():
                (4, None, 1), "the game's sleeps passed on as the host's pass on 4 threads")
         broken(tmp, "host-too", "@SLEEP@", "short_timer < (guest ? 1 : 2)", "!short_timer && (guest || 1)",
                (4, None, 1), "the host's own short sleeps on the timer pass on 4 threads")
-        broken(tmp, "one-group", "@SLEEP@", "GetActiveProcessorGroupCount() == 1 && ", "",
+        broken(tmp, "one-group", "@PROCS@", "GetActiveProcessorGroupCount() == 1 && ", "",
                (4, None, 0, 2), "one group's mask taken for the process's processors passes")
+        broken(tmp, "no-limit", "@SLEEP@", "InterlockedIncrement(&short_pollers) <= poll_cap",
+               "(InterlockedIncrement(&short_pollers), 1)",
+               (16, None, 0), "the game's short sleeps all yielding past the limit passes")
+        broken(tmp, "serial-counted", "@SLEEP@", "guest && poll_cap && !hos_thread_serial(hos_self())", "guest && poll_cap",
+               (16, None, 0), "a serial thread sent to the timer at the limit passes")
+        broken(tmp, "leak", "@SLEEP@", "if (counted) InterlockedDecrement(&short_pollers);", "",
+               (16, None, 0), "a poller never counted out passes")
         edge = "enum { SHORT_SLEEP_TIMER_THREADS = 6 };"   # (the number the measurements gave: a change of it is a change here too)
-        check(edge in parts["@CHOICE@"], "SHORT_SLEEP_TIMER_THREADS is no longer 6: the cases above name 6 and 7 threads")
+        check(edge in parts["@PROCS@"], "SHORT_SLEEP_TIMER_THREADS is no longer 6: the cases above name 6 and 7 threads")
 
 
 if __name__ == "__main__":

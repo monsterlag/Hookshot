@@ -805,7 +805,7 @@ ChainState& chain_state() {
     return c;
 }
 bool chain_start() { return fsr3::supported(); }
-int chain_prepare(VkCommandBuffer, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, uint32_t* in_w, uint32_t* in_h,
+int chain_prepare(VkCommandBuffer, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, bool, uint32_t* in_w, uint32_t* in_h,
                   const char** why) {
     // (the passes' pipelines and images for these sizes, here and not in the evaluation: an image that cannot be made now
     // (VRAM full as the size changes) is "not this frame", and the next frame tries again, as fsr3_upscale's own path did)

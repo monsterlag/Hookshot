@@ -57,8 +57,9 @@ def main():
           'vk_menu.cpp: draw_options must offer {ui::kCompact, "Compact", compact_key_name} prompt')
     check('{ui::kCompact, "Full menu", compact_key_name}' in menu_cpp,
           'vk_menu.cpp: draw_tune_bar must offer {ui::kCompact, "Full menu", compact_key_name} prompt')
-    # (Save my pipeline list, an action rather than a page, says Save: tests/test_pipeline_share.py)
-    check('tune_prompts[1] = {ui::kConfirm, confirms ? (pending == &r ? "Confirm" : r.name) : is_share_row(r) ? "Save" : "Open"};' in menu_cpp,
+    # (Save my pipeline list and the Bug report, actions rather than pages, say Save: tests/test_pipeline_share.py,
+    # tests/test_bug_report.py)
+    check('tune_prompts[1] = {ui::kConfirm, confirms ? (pending == &r ? "Confirm" : r.name) : &r == &rows[kBugReportRow] || is_share_row(r) ? "Save" : "Open"};' in menu_cpp,
           "vk_menu.cpp: draw_tune_bar must use row name or Confirm for Restart/Quit")
 
     # 5. Motion tab title in compact bar

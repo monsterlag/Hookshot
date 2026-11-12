@@ -33,6 +33,8 @@ def main():
     source = (ROOT / "gpu/vk/vk_texture.cpp").read_text(encoding="utf-8-sig")
     mip = block(source, "{   // huge textures leave out their top levels:")
     policy = block(source, "bool low_vram_texture_mips(") if "bool low_vram_texture_mips(" in source else ""
+    helpers = "\n".join(block(source, marker) for marker in (
+        "bool is_bc(VkFormat f)", "bool is_astc(VkFormat f)", "uint64_t texture_level_units("))
     fixture = r'''
 #include <algorithm>
 #include <cstdint>
@@ -50,14 +52,15 @@ struct Texture {
     VkImageType type = VK_IMAGE_TYPE_2D;
 };
 struct { bool sparse_images = false; VkPhysicalDevice physical{}; } dev;
-struct { int preset = 1; } opts;
+struct { int preset = 1, budget = 1; } opts;
+constexpr int kAutoPreset = 6;   // (gpu/vk/vk_menu.h: the Quality preset Auto (this PC), its tier's budgets in budget)
 uint64_t allowed;
 bool query_ok;
 bool vram_usage(uint64_t* used, uint64_t* budget, uint64_t* = nullptr) {
     *used = 2000ull << 20; *budget = allowed; return query_ok;
 }
 void logf(const char*, ...) {}
-bool is_bc(VkFormat f) { return f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_BC7_SRGB_BLOCK; }
+@HELPERS@
 extern "C" VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceSparseImageFormatProperties(
         VkPhysicalDevice, VkFormat, VkImageType, VkSampleCountFlagBits, VkImageUsageFlags, VkImageTiling,
         uint32_t* n, VkSparseImageFormatProperties*) { *n = 0; }
@@ -73,8 +76,9 @@ void check_image(const Texture& x, int skip, int width, int levels) {
     CHECK(x.levels == (uint32_t)levels);
 }
 int main(int argc, char** argv) {
-    CHECK(argc == 12);
+    CHECK(argc == 13);
     opts.preset = std::atoi(argv[1]);
+    opts.budget = std::atoi(argv[12]);
     allowed = std::strtoull(argv[2], nullptr, 10) << 20;
     query_ok = std::atoi(argv[3]) != 0;
     nvn_tex t{}; t.d.samples = 1;
@@ -90,14 +94,15 @@ int main(int argc, char** argv) {
     if (std::atoi(argv[10])) {
         // The budget is cached, but choosing Minimum in the menu must still
         // change defaults for textures made afterwards, and switching back too.
-        opts.preset = 1;
+        opts.preset = 1, opts.budget = 1;
         Texture minimum{3072,3072,1,12}; trim(minimum,&t); check_image(minimum,2,768,10);
-        opts.preset = 2;
+        opts.preset = 2, opts.budget = 2;
         Texture low{3072,3072,1,12}; trim(low,&t); check_image(low,0,3072,12);
     }
     std::printf("PASS %s\n",argv[11]);
 }
-'''.replace("@POLICY@", policy).replace("@MIP@", mip)
+'''.replace("@HELPERS@", helpers).replace("@POLICY@", policy).replace("@MIP@", mip)
+    # The preset: a number, its budget the same (as a preset sets it); or (preset, budget), Auto (this PC) with its tier's budgets.
     # Literal outcomes: (skip, width, levels) for a 3072-square image and a
     # 1365-square, 90-layer image. No expected result calls the production policy.
     original = (0, 3072, 12, 0, 1365, 11)
@@ -110,6 +115,10 @@ int main(int argc, char** argv) {
         ("zero-budget", 1, 0, 1, {}, original, 0),
         ("failed-budget-query", 1, 3674, 0, {}, original, 0),
         ("custom-preset", 0, 3674, 1, {}, original, 0),
+        ("auto-at-minimum-tier", (6, 1), 3674, 1, {}, minimum, 0),
+        ("auto-at-minimum-tier-large-budget", (6, 1), 7500, 1, {}, original, 0),
+        ("auto-at-balanced-tier", (6, 3), 3674, 1, {}, original, 0),
+        ("auto-with-the-players-vram-budget", (6, 0), 3674, 1, {}, original, 0),
         ("low-preset-and-menu-changes", 2, 3674, 1, {}, original, 1),
         ("dimension-override", 1, 3674, 1, {"RX_VK_TEX_MAX_DIM": "2048"},
          (1, 1536, 11, 0, 1365, 11), 0),
@@ -143,7 +152,8 @@ int main(int argc, char** argv) {
             for key in ("RX_VK_LOW_VRAM_MIPS", "RX_VK_TEX_MAX_DIM", "RX_VK_TEX_MAX_MB", "RX_VK_TEX_SKIP_MB"):
                 env.pop(key, None)
             env.update(overrides)
-            args = [preset, budget, query, *expected, switch, name]
+            preset, memory_budget = preset if isinstance(preset, tuple) else (preset, preset)
+            args = [preset, budget, query, *expected, switch, name, memory_budget]
             subprocess.run([str(exe), *map(str, args)], env=env, check=True)
     print("PASS %d mip-policy configurations" % len(cases))
 

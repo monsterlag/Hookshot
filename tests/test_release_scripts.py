@@ -7,7 +7,9 @@ v2.1.0's promotion got wrong: a release found by listing, drafts too, so a faile
 draft never gets a published release made beside it; the files go to the release by its id; Promote refuses a
 version already published, a tag with two releases and a second run in progress; and the record is made once. Also
 that the table names every file (the RecompLauncher zip too), and that the rc prerelease, which release candidates'
-AppImages update from, holds the newest release candidate or release and is never "latest".
+AppImages update from, holds the newest release candidate or release and is never "latest". And that the nightly
+moves forward along main while newer pushes are still building, never back, also when the Linux and Windows runs of
+two commits race each other, and that each platform's files stay one commit's.
 """
 import argparse
 import hashlib
@@ -64,6 +66,14 @@ def public(r):
     return {k: v for k, v in r.items() if k != "assets"}
 def asset(a):
     return {k: v for k, v in a.items() if k != "content"}
+def compare(base, head):   # (GitHub's compare status of head against base, on main's history, oldest first)
+    history = s.get("history")
+    if history is None:
+        return "ahead"
+    if base not in history or head not in history:
+        return "diverged"
+    b, h = history.index(base), history.index(head)
+    return "identical" if b == h else "ahead" if h > b else "behind"
 argv = sys.argv[1:]
 s["calls"].append(argv)
 fails = os.environ.get("FAKE_GH_FAIL", "").split(",")
@@ -77,18 +87,30 @@ if argv[:2] == ["release", "create"]:
     body = "generated notes" if "--generate-notes" in argv else ""
     if "--notes-file" in argv:
         body = open(argv[argv.index("--notes-file") + 1]).read()
+    if "--notes" in argv:
+        body = argv[argv.index("--notes") + 1]
     s["next_id"] += 1
     s["releases"].append({"id": s["next_id"], "tag_name": tag, "draft": draft, "prerelease": "--prerelease" in argv,
                           "published_at": None if draft else "now", "html_url": "https://example/" + tag,
                           "body": body, "assets": []})
     save()
     sys.exit(0)
-if argv[:2] == ["release", "view"]:
+if argv[:2] in (["release", "view"], ["release", "edit"], ["release", "delete-asset"]):
     tag = argv[2]
     rs = [r for r in s["releases"] if r["tag_name"] == tag and not r["draft"]]
     if not rs:
         fail(404, "release not found")
-    out({"body": rs[0]["body"]}, argv[argv.index("--jq") + 1] if "--jq" in argv else None)
+    r = rs[0]
+    if argv[1] == "view":
+        out({"body": r["body"], "assets": [{"name": a["name"]} for a in r["assets"]]},
+            argv[argv.index("--jq") + 1] if "--jq" in argv else None)
+    elif argv[1] == "edit":
+        if "--notes" in argv:
+            r["body"] = argv[argv.index("--notes") + 1]
+        if "--prerelease" in argv:
+            r["prerelease"] = True
+    else:
+        r["assets"] = [a for a in r["assets"] if a["name"] != argv[3]]
     save()
     sys.exit(0)
 assert argv[0] == "api", argv
@@ -131,6 +153,12 @@ elif p[:2] == ["releases", "assets"]:
     for r in s["releases"]:
         for a in r["assets"]:
             if a["id"] == int(p[2]):
+                # (FAKE race: the other run of the nightly replaced this file, under a new id, since it was listed)
+                if s.get("race", {}).get(a["name"]):
+                    s["race"][a["name"]] -= 1
+                    s["next_id"] += 1
+                    a["id"] = s["next_id"]
+                    fail(404, "Not Found")
                 sys.stdout.write(a["content"])
                 save()
                 sys.exit(0)
@@ -158,6 +186,10 @@ elif p == ["releases"] and method == "POST":
 elif len(p) == 2 and p[0] == "releases" and method == "PATCH":
     r = release(p[1])
     change = json.loads(data)
+    # (as GitHub does: a draft changed without its tag_name comes back with an "untagged-..." one. v2.2.0-rc.1's draft
+    # lost its tag so when its notes were written, and was then not found by its tag for the publish)
+    if r["draft"] and "tag_name" not in change:
+        r["tag_name"] = "untagged-%s" % p[1]
     r.update(change)
     if change.get("draft") is False and not r.get("published_at"):
         r["published_at"] = "now"
@@ -172,13 +204,23 @@ elif p[:3] == ["git", "ref", "tags"]:
 elif p[:3] == ["git", "refs", "tags"] and method == "PATCH":
     if p[3] not in s["tags"]:
         fail(422, "Reference does not exist")
+    # (FAKE race: the other platform's run moves the tag between this run's look at it and its move)
+    race = s.get("race", {}).pop(p[3], None)
+    if race:
+        s["tags"][p[3]] = race
+    if fields.get("force") != "true" and compare(s["tags"][p[3]], fields["sha"]) not in ("ahead", "identical"):
+        fail(422, "Update is not a fast forward")
     s["tags"][p[3]] = fields["sha"]
 elif p == ["git", "refs"] and method == "POST":
-    s["tags"][fields["ref"].removeprefix("refs/tags/")] = fields["sha"]
+    ref = fields["ref"].removeprefix("refs/tags/")
+    if ref in s["tags"]:
+        fail(422, "Reference already exists")
+    s["tags"][ref] = fields["sha"]
 elif p == ["commits", "main"]:
     out({"sha": s["main"]}, jq)
 elif p[0] == "compare":
-    out({"status": "ahead"}, jq)
+    base, head = p[1].split("...")
+    out({"status": compare(base, head)}, jq)
 elif p[:2] == ["actions", "runs"]:
     out({"workflow_id": 7}, jq)
 elif p[:2] == ["actions", "workflows"]:
@@ -222,10 +264,10 @@ class ReleaseScripts(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def given(self, releases, tags=None, runs=()):
-        self.state_file.write_text(json.dumps({
+    def given(self, releases, tags=None, runs=(), **more):
+        self.state_file.write_text(json.dumps(dict({
             "releases": releases, "tags": tags or {}, "runs": list(runs), "main": COMMIT, "next_id": 1000,
-            "calls": []}), encoding="utf-8")
+            "calls": []}, **more)), encoding="utf-8")
 
     def state(self):
         return json.loads(self.state_file.read_text(encoding="utf-8"))
@@ -295,6 +337,178 @@ class ReleaseScripts(unittest.TestCase):
         self.assertIn("Which file do I download?", made["body"])
         check = self.run_script("release_files.sh", "check", "v2.1.0", "hookshot-linux.txt")
         self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+
+    def test_sums_replaced_between_listing_and_read_are_read_again(self):
+        # (CI, the nightly's two runs at once: the other platform's run replaced SHA256SUMS after this run listed it;
+        # the failed read counted as none there, and each run uploaded it again, over the other's read, five times)
+        self.given([], tags={"v2.1.0": COMMIT})
+        r = self.upload()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        state = self.state()
+        state.update(race={"SHA256SUMS": 2}, calls=[])
+        self.state_file.write_text(json.dumps(state), encoding="utf-8")
+        check = self.run_script("release_files.sh", "check", "v2.1.0", "hookshot-linux.txt")
+        self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+        r = self.run_script("release_files.sh", "finish", "v2.1.0")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.state()["race"], {"SHA256SUMS": 0})
+        self.assertFalse([c for c in self.state()["calls"] if any("name=SHA256SUMS" in a for a in c)])
+
+    # the nightly (scripts/release_upload.sh nightly): main's history Z, A, B, the newest last
+
+    Z, A, B = ("1" * 40, "a" * 40, "b" * 40)
+
+    def nightly_files(self, sha, platform):
+        """This run's files: the Linux AppImage, its .zsync and list, or the Windows setup, its list and zip."""
+        out = self.dir / ("dist-" + platform + "-" + sha[:7])
+        out.mkdir(exist_ok=True)
+        version = "v2.1.0-rc.3-%d-g%s" % ({self.Z: 1, self.A: 2, self.B: 3}.get(sha, 9), sha[:8])
+        names = (["Hookshot-%s-x86_64.AppImage" % version, "Hookshot-%s-x86_64.AppImage.zsync" % version,
+                  "hookshot-linux.txt"] if platform == "linux" else
+                 ["HookshotBuilder.exe", "hookshot-setup.txt", "Hookshot-%s-Windows-x64.zip" % version])
+        for name in names:
+            (out / name).write_text("%s %s %s" % (platform, version, name), encoding="utf-8")
+        return [str(out / name) for name in names]
+
+    def given_nightly(self, held, linux_at=None, windows_at=None, **more):
+        """The nightly release with the Linux files of linux_at and the Windows files of windows_at, its tag at held."""
+        nightly = rel(90, "nightly", False, True, "old notes")
+        for sha, platform in ((linux_at, "linux"), (windows_at, "windows")):
+            for f in self.nightly_files(sha, platform) if sha else ():
+                data = Path(f).read_bytes()
+                nightly["assets"].append({"id": 9000 + len(nightly["assets"]), "name": os.path.basename(f),
+                                          "content": data.decode(),
+                                          "digest": "sha256:" + hashlib.sha256(data).hexdigest()})
+        tags = {"nightly": held} if held else {}
+        self.given([nightly], tags=tags, history=[self.Z, self.A, self.B], **dict({"main": self.B}, **more))
+
+    def nightly(self, sha, platform="linux", **env):
+        return self.run_script("release_upload.sh", "nightly", *self.nightly_files(sha, platform), GITHUB_SHA=sha,
+                               **env)
+
+    def nightly_assets(self):
+        (r,) = [x for x in self.state()["releases"] if x["tag_name"] == "nightly"]
+        return {a["name"]: a["content"] for a in r["assets"]}
+
+    def test_nightly_moves_forward_while_main_has_newer_commits(self):
+        # (run 43112700938: 57ed3aa8 was built after main had moved on, and the nightly stayed where it was)
+        self.given_nightly(self.Z, linux_at=self.Z)
+        r = self.nightly(self.A)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.state()["tags"]["nightly"], self.A)
+        files = self.nightly_assets()
+        self.assertIn("Hookshot-v2.1.0-rc.3-2-gaaaaaaaa-x86_64.AppImage", files)
+        self.assertIn("Hookshot-v2.1.0-rc.3-2-gaaaaaaaa-x86_64.AppImage.zsync", files)
+        self.assertNotIn("Hookshot-v2.1.0-rc.3-1-g11111111-x86_64.AppImage", files)
+        self.assertNotIn("Hookshot-v2.1.0-rc.3-1-g11111111-x86_64.AppImage.zsync", files)
+        self.assertEqual(files["hookshot-linux.txt"], "linux v2.1.0-rc.3-2-gaaaaaaaa hookshot-linux.txt")
+        self.assertIn("SHA256SUMS", files)
+        # (no force: a fast-forward, which GitHub refuses when the tag moved past this commit)
+        moves = [c for c in self.state()["calls"] if "repos/%s/git/refs/tags/nightly" % REPO in c]
+        self.assertEqual(len(moves), 1)
+        self.assertIn("force=false", moves[0])
+        (body,) = [x["body"] for x in self.state()["releases"] if x["tag_name"] == "nightly"]
+        self.assertIn("Each file is named by the commit it was built from", body)
+        self.assertIn("Which file do I download?", body)
+
+    def test_nightly_never_goes_back(self):
+        # (an older commit's run, or a re-run of one, finishing after a newer commit's)
+        for platform in ("linux", "windows"):
+            with self.subTest(platform=platform):
+                self.given_nightly(self.B, linux_at=self.B, windows_at=self.B)
+                before = self.nightly_assets()
+                r = self.nightly(self.A, platform)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn("comes after", r.stdout)
+                self.assertEqual(self.state()["tags"]["nightly"], self.B)
+                self.assertEqual(self.nightly_assets(), before)
+                self.assertFalse(self.uploads())
+
+    def test_nightly_other_platform_of_the_same_commit_adds_its_files(self):
+        self.given_nightly(self.A, linux_at=self.A, windows_at=self.Z)
+        r = self.nightly(self.A, "windows")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.state()["tags"]["nightly"], self.A)
+        files = self.nightly_assets()
+        self.assertIn("Hookshot-v2.1.0-rc.3-2-gaaaaaaaa-Windows-x64.zip", files)
+        self.assertNotIn("Hookshot-v2.1.0-rc.3-1-g11111111-Windows-x64.zip", files)
+        self.assertIn("Hookshot-v2.1.0-rc.3-2-gaaaaaaaa-x86_64.AppImage", files)
+        self.assertFalse([c for c in self.state()["calls"] if "PATCH" in c and any("git/refs" in a for a in c)])
+
+    def test_nightly_platforms_move_on_their_own(self):
+        # (Windows of B first, then Linux of B: between the two, Linux's files are A's, which its list says)
+        self.given_nightly(self.A, linux_at=self.A, windows_at=self.A)
+        self.assertEqual(self.nightly(self.B, "windows").returncode, 0)
+        files = self.nightly_assets()
+        self.assertEqual(self.state()["tags"]["nightly"], self.B)
+        self.assertIn("Hookshot-v2.1.0-rc.3-3-gbbbbbbbb-Windows-x64.zip", files)
+        self.assertIn("Hookshot-v2.1.0-rc.3-2-gaaaaaaaa-x86_64.AppImage", files)
+        r = self.nightly(self.B, "linux")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        files = self.nightly_assets()
+        self.assertIn("Hookshot-v2.1.0-rc.3-3-gbbbbbbbb-x86_64.AppImage", files)
+        self.assertNotIn("Hookshot-v2.1.0-rc.3-2-gaaaaaaaa-x86_64.AppImage", files)
+
+    def test_nightly_race_lost_to_a_newer_commit_changes_nothing(self):
+        # (Linux of A looked at the tag (Z) before Windows of B moved it; its fast-forward from B to A is refused)
+        self.given_nightly(self.Z, linux_at=self.Z, windows_at=self.Z, race={"nightly": self.B})
+        before = self.nightly_assets()
+        r = self.nightly(self.A, "linux")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.state()["tags"]["nightly"], self.B)
+        self.assertEqual(self.nightly_assets(), before)
+        self.assertFalse(self.uploads())
+
+    def test_nightly_race_with_an_older_commit_still_moves_forward(self):
+        # (Windows of B looked at the tag (Z) before Linux of A moved it: B comes after A, so the move goes on)
+        self.given_nightly(self.Z, linux_at=self.Z, windows_at=self.Z, race={"nightly": self.A})
+        r = self.nightly(self.B, "windows")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.state()["tags"]["nightly"], self.B)
+        self.assertIn("Hookshot-v2.1.0-rc.3-3-gbbbbbbbb-Windows-x64.zip", self.nightly_assets())
+
+    def test_nightly_two_runs_at_once_end_at_the_newer_commit(self):
+        for first in ("A", "B"):
+            with self.subTest(first=first):
+                self.given_nightly(self.Z, linux_at=self.Z, windows_at=self.Z)
+                order = [(self.A, "linux"), (self.B, "windows")]
+                if first == "B":
+                    order.reverse()
+                env = dict(self.env)
+                runs = [subprocess.Popen(["bash", str(ROOT / "scripts/release_upload.sh"), "nightly",
+                                          *self.nightly_files(sha, platform)], cwd=self.dir, text=True,
+                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                         env=dict(env, GITHUB_SHA=sha)) for sha, platform in order]
+                for run in runs:
+                    output = run.communicate(timeout=120)[0]
+                    self.assertEqual(run.returncode, 0, output)
+                self.assertEqual(self.state()["tags"]["nightly"], self.B)
+                files = self.nightly_assets()
+                self.assertIn("Hookshot-v2.1.0-rc.3-3-gbbbbbbbb-Windows-x64.zip", files)
+                # (Linux's files are A's, or still Z's when it lost the race: never a mix)
+                linux = sorted(n for n in files if ".AppImage" in n)
+                self.assertIn(linux, [["Hookshot-v2.1.0-rc.3-%s-x86_64.AppImage" % v,
+                                       "Hookshot-v2.1.0-rc.3-%s-x86_64.AppImage.zsync" % v]
+                                      for v in ("1-g11111111", "2-gaaaaaaaa")])
+                self.assertIn(linux[0].split("-x86_64")[0].split("Hookshot-")[1], files["hookshot-linux.txt"])
+
+    def test_nightly_made_when_there_is_no_tag(self):
+        self.given_nightly(None)
+        r = self.nightly(self.A)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.state()["tags"]["nightly"], self.A)
+
+    def test_nightly_after_main_was_rewritten(self):
+        # (the tag holds a commit no longer on main: main's newest commit takes it; an older one leaves it)
+        gone = "9" * 40
+        self.given_nightly(gone, main=self.B)
+        r = self.nightly(self.A)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.state()["tags"]["nightly"], gone)
+        self.assertFalse(self.uploads())
+        r = self.nightly(self.B)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.state()["tags"]["nightly"], self.B)
 
     def test_two_releases_of_a_tag_are_refused(self):
         self.given([rel(5, "v2.1.0", True, False), rel(6, "v2.1.0", False, False)])

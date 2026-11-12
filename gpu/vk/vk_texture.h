@@ -43,8 +43,8 @@ struct Texture {
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     bool cube = false;        // CUBE_COMPATIBLE
     bool astc = false;        // ASTC blocks decoded into RGBA8 (block_w x block_h)
-    bool bc = false;          // (and kept as BC3: big ones, re-encoded on the GPU after decoding; vk_texture.cpp)
-    bool bc_resized = false;  // (hookshot-amd: its BC3 image is a resized copy, uneven block levels on AMD; vk_texture.cpp)
+    bool bc = false;          // (and kept as BC3 or BC7: big ones, re-encoded on the GPU after decoding; vk_texture.cpp)
+    bool bc_resized = false;  // (hookshot-amd: its BC image is a resized copy, uneven block levels on AMD; vk_texture.cpp)
     int block_w = 1, block_h = 1, bpb = 0;   // the storage's blocks
     // the game's texture
     uint64_t gpu = 0, guest = 0, guest_size = 0;   // storage (GPU address, guest address, bytes)
@@ -68,6 +68,9 @@ struct Texture {
     uint64_t gpu_wrote_seen = 0;   // (the newest finished GPU write into its storage it was uploaded after)
     uint64_t last_written = 0;     // (the frame the GPU last wrote it: a render target, each frame it is used)
     uint64_t first_written = 0;    // (the frame its GPU contents began: written in that frame alone, a table the game baked)
+    uint64_t written_back_for = 0; // (the last_written its texels went into guest memory for: drawn_writeback.h)
+    bool writeback_noted = false;  // (in the list of textures waiting for that)
+    uint64_t written_back_hash = 0; // (its memory's hash after that write-back: still its own texels there, or the CPU's since)
     uint64_t verify_hash = 0;      // (RX_VK_VERIFY_DIM: its guest memory's hash when last uploaded)
     uint32_t checked_epoch = 0;
     uint64_t upload_value = 0;   // (the submission its last upload was recorded in, and the parallel replay's segment
@@ -140,6 +143,9 @@ int texture_segment_end(int index);
 uint32_t texture_epoch();
 /// Changes whenever a texture is destroyed (pointers to textures kept elsewhere go stale)
 uint64_t texture_destroy_generation();
+// (hookshot, RX_VK_FRAME_TRACE: time no other column has; totals in ns, the trace takes their differences)
+int64_t texture_readback_wait_ns();   // (a read-back's submit and wait for the GPU: the write-backs before an eviction)
+int64_t texture_frame_ns();           // (texture_frame as a whole: each present's eviction, compaction and sweeps)
 /// The texture an NVN texture's storage is (made and uploaded at first use, uploaded again when the CPU wrote its
 /// storage since). null for formats and targets that have no image (buffers, unknown formats).
 Texture* texture_get(const nvn_tex* t, bool for_sampling);

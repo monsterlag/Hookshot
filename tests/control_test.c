@@ -179,9 +179,14 @@ static int fake_destination(int i, const char **child, const char **adult) {
     *child = dest_child[i], *adult = dest_adult[i];
     return 1;
 }
+/* (the age switch: asked as a teleport is, with teleport_asked = AGE_ASKED + 1 for the adult, + 0 the child; taken, Link
+   that age already: nothing done (result 2), else his age flips and the map reloads in it, as hos_main.c does.
+   stale_age: the state's sample of the age is the other one, as an old sample can be) */
+enum { AGE_ASKED = 100 };
+static volatile int fake_child = 1, stale_age;
 static int fake_state(int *event, int *loading, int *child) {
     if (!fake_map(NULL, 0)) return 0;
-    *event = 0, *loading = 1, *child = 1;
+    *event = 0, *loading = 1, *child = __atomic_load_n(&fake_child, __ATOMIC_RELAXED) ^ (stale_age != 0);
     return 1;
 }
 static int fake_teleport(int i) {
@@ -196,12 +201,19 @@ static int fake_teleport_result(int ticket, char *why, size_t why_cap, char *map
     log_lock();
     int r = -2;
     if (tp_done_ticket == ticket) {
-        r = tp_result, *accepted = r > 0;
+        r = tp_result, *accepted = r == 1;
         snprintf(why, why_cap, "%s", r < 0 ? "this destination has no map for the child" : "");
-        snprintf(map, map_cap, "%s", r > 0 ? fake_map_now : "");
+        snprintf(map, map_cap, "%s", r == 1 ? fake_map_now : "");
     } else if (tp_taking == ticket || (tp_ticket == ticket && __atomic_load_n(&teleport_asked, __ATOMIC_RELAXED) >= 0)) r = 0;
     log_unlock();
     return r;
+}
+static int fake_age(int adult) {
+    log_lock();
+    const int ticket = ++tp_ticket;
+    __atomic_store_n(&teleport_asked, AGE_ASKED + (adult ? 1 : 0), __ATOMIC_RELAXED);
+    log_unlock();
+    return ticket;
 }
 static void fake_teleport_cancel(int ticket) {
     log_lock();
@@ -214,7 +226,7 @@ static HosControlGame game = {
     .mem_write = fake_mem_write, .save_root = fake_save_root, .log = fake_log, .quit = fake_quit,
     .renderer = fake_renderer, .version = "test", .map = fake_map, .destination = fake_destination,
     .teleport = fake_teleport, .teleport_result = fake_teleport_result, .teleport_cancel = fake_teleport_cancel,
-    .oot_state = fake_state};
+    .age = fake_age, .oot_state = fake_state};
 
 static void *game_thread(void *unused) {
     (void)unused;
@@ -230,7 +242,19 @@ static void *game_thread(void *unused) {
             const int ticket = tp_ticket;
             if (t >= 0) tp_taking = ticket;
             log_unlock();
-            if (t >= 0) {
+            if (t >= AGE_ASKED) {   /* (the age switch: the current map, reloaded in the age asked for; that age already: none) */
+                sleep_ms(20);
+                log_lock();
+                const int child = t == AGE_ASKED;
+                if (__atomic_load_n(&fake_child, __ATOMIC_RELAXED) == child) tp_result = 2;
+                else {
+                    __atomic_store_n(&fake_child, child, __ATOMIC_RELAXED);
+                    snprintf(fake_map_now, sizeof fake_map_now, "%s", child ? dest_child[0] : dest_adult[0]);
+                    tp_result = 1;
+                }
+                tp_done_ticket = ticket, tp_taking = 0;
+                log_unlock();
+            } else if (t >= 0) {
                 sleep_ms(20);
                 log_lock();
                 tp_done_ticket = ticket, tp_result = dest_child[t] ? 1 : -1, tp_taking = 0;
@@ -338,6 +362,18 @@ static void ask(Client *c, const char *req, const char *id_text, char *out, size
     for (;;) {
         CHECK(hear(c, out, cap, ms));
         if (!strncmp(out, want, strlen(want))) return;
+    }
+}
+/* status until its line has want (and want2, if given), asked again for at most ms: its game state is the one the
+   bridge's thread samples every 100 ms, so a change shows within that, not at the next frame */
+static void status_until(Client *c, const char *id_text, const char *want, const char *want2, char *out, size_t cap,
+                         int ms) {
+    char req[64];
+    snprintf(req, sizeof req, "{\"id\":%s,\"cmd\":\"status\"}\n", id_text);
+    for (int waited = 0;; waited += 20) {
+        ask(c, req, id_text, out, cap, 2000);
+        if ((strstr(out, want) && (!want2 || strstr(out, want2))) || waited >= ms) return;
+        sleep_ms(20);
     }
 }
 /* the replies with these two ids, whichever comes first (events and other replies skipped) */
@@ -956,8 +992,47 @@ int main(int argc, char **argv) {
         ask(c, "{\"id\":78,\"cmd\":\"status\"}\n", "78", line, sizeof line, 2000);
         CHECK(strstr(line, "\"map\":\"KokiriForest_Child\"") &&
               strstr(line, "\"game\":{\"event\":false,\"loading\":true,\"age\":\"child\"}"));
+        /* the age switch: none is the other age, and the reply has it and the map it reloads; to the age Link has already:
+           said, nothing done; anything but child or adult: a bad request */
+        ask(c, "{\"id\":79,\"cmd\":\"age\",\"to\":\"teen\"}\n", "79", line, sizeof line, 2000);
+        CHECK(strstr(line, "\"error\":\"bad_request\""));
+        ask(c, "{\"id\":791,\"cmd\":\"age\",\"to\":\"child\"}\n", "791", line, sizeof line, 2000);
+        CHECK(strstr(line, "\"ok\":true") && strstr(line, "\"age\":\"child\",\"sent\":false"));
+        ask(c, "{\"id\":792,\"cmd\":\"age\"}\n", "792", line, sizeof line, 3000);
+        CHECK(strstr(line, "\"ok\":true") &&
+              strstr(line, "\"age\":\"adult\",\"sent\":true,\"map\":\"KokiriForest_Adult\",\"accepted\":true"));
+        status_until(c, "793", "\"age\":\"adult\"", NULL, line, sizeof line, 2000);
+        CHECK(strstr(line, "\"age\":\"adult\""));
+        /* the bridge's sample of the age old (it says the child, Link is the adult): the game checks the age asked for when
+           it takes it, so "adult" does not flip the adult into the child, and none (the other age by the sample: the
+           adult) neither; both say the adult already */
+        stale_age = 1;
+        ask(c, "{\"id\":7931,\"cmd\":\"age\",\"to\":\"adult\"}\n", "7931", line, sizeof line, 3000);
+        CHECK(strstr(line, "\"ok\":true") && strstr(line, "\"age\":\"adult\",\"sent\":false"));
+        CHECK(__atomic_load_n(&fake_child, __ATOMIC_RELAXED) == 0);
+        ask(c, "{\"id\":7932,\"cmd\":\"age\"}\n", "7932", line, sizeof line, 3000);
+        CHECK(strstr(line, "\"ok\":true") && strstr(line, "\"age\":\"adult\",\"sent\":false"));
+        CHECK(__atomic_load_n(&fake_child, __ATOMIC_RELAXED) == 0);
+        stale_age = 0;
+        /* not taken (not in play): a timeout that names the age switch, and the ask is withdrawn; one not taken yet is
+           replaced by a later teleport, as a teleport is */
+        teleport_held = 1;
+        ask(c, "{\"id\":794,\"cmd\":\"age\",\"to\":\"child\",\"timeout\":0.2}\n", "794", line, sizeof line, 3000);
+        CHECK(strstr(line, "\"error\":\"timeout\"") && strstr(line, "age switch"));
+        CHECK(__atomic_load_n(&teleport_asked, __ATOMIC_RELAXED) == -1);
+        say(c, "{\"id\":795,\"cmd\":\"age\"}\n");
+        sleep_ms(30);
+        ask(c, "{\"id\":796,\"cmd\":\"teleport\",\"to\":0,\"wait\":false}\n", "796", line, sizeof line, 3000);
+        CHECK(hear(c, line, sizeof line, 3000) && strstr(line, "\"id\":795") && strstr(line, "\"error\":\"cancelled\""));
+        teleport_held = 0;
+        wait_frames(5);
+        /* without waiting, the reply is at once; the switch back to the child then happens at the next update */
+        ask(c, "{\"id\":797,\"cmd\":\"age\",\"to\":\"child\",\"wait\":false}\n", "797", line, sizeof line, 2000);
+        CHECK(strstr(line, "\"ok\":true") && strstr(line, "\"age\":\"child\",\"sent\":null"));
+        status_until(c, "798", "\"age\":\"child\"", "\"map\":\"KokiriForest_Child\"", line, sizeof line, 2000);
+        CHECK(strstr(line, "\"map\":\"KokiriForest_Child\"") && strstr(line, "\"age\":\"child\""));
         hangup(sub);
-        puts("PASS: (OoT) the map in status, events and waits; the teleport by index or map, and its list");
+        puts("PASS: (OoT) the map in status, events and waits; the teleport by index or map, and its list; the age switch");
     }
 
     /* a client gone in the middle of a press: its input is let go */

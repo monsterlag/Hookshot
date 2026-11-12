@@ -126,7 +126,13 @@ static void drawable_size(void *w, int *width, int *height) {
 /* (SDL's display calls belong on this thread: the loop asks every second, the renderer reads what it found) */
 static volatile int refresh_now;
 static int refresh_mhz(void *w) { (void)w; return __atomic_load_n(&refresh_now, __ATOMIC_RELAXED); }
-static MkwVkWindow vk_window = {MKWVK_WINDOW_VERSION, create_surface, drawable_size, NULL, refresh_mhz};
+/* (the desktop's size in pixels, read on this thread once the window is made: the Quality preset Auto (this PC)) */
+static volatile int desktop_w, desktop_h;
+static void desktop_size(void *w, int *width, int *height) {
+    (void)w;
+    *width = __atomic_load_n(&desktop_w, __ATOMIC_RELAXED), *height = __atomic_load_n(&desktop_h, __ATOMIC_RELAXED);
+}
+static MkwVkWindow vk_window = {MKWVK_WINDOW_VERSION, create_surface, drawable_size, NULL, refresh_mhz, desktop_size};
 
 /* Esc let the captured mouse go just before it opened the Insert menu (Menu shortcut "Insert, F1 or Esc"):
    the capture that comes back when the menu closes. Spent by the next capture or menu */
@@ -207,6 +213,11 @@ int hos_display_owns_sdl(void) { return sdl_ready; }   /* (controllers stay on t
 
 /* main(), before the game: SDL's video on this, the main, thread; the screen's size for GetSystemMetrics.
    Returns 1 when ready, 0 for explicit headless, -1 for startup failure. */
+static const char *window_title(const char *fallback) {
+    const char *e = getenv("HOS_WINDOW_TITLE");
+    return (e && e[0]) ? e : fallback;
+}
+
 int hos_display_init(void) {
     if (env_on("HOS_HEADLESS")) return 0;
     if (!hos_sdl_load()) {
@@ -214,7 +225,9 @@ int hos_display_init(void) {
         fprintf(stderr, "display: no SDL: no window\n");
         return -1;
     }
-    hos_sdl_identity("Hookshot", HOS_APP_ID);
+    const char *env_class = getenv("HOS_WM_CLASS");
+    const char *app_id = (env_class && env_class[0]) ? env_class : HOS_APP_ID;
+    hos_sdl_identity(window_title("Hookshot"), app_id);
     hos_sdl_hint("SDL_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR", "0");
     hos_sdl_hint("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1");
     /* (bundled SDL tries x11 before wayland. NVIDIA's X11 surface has no mailbox, and an immediate
@@ -265,7 +278,7 @@ void hos_display_loop(void) {
         int w = 0, h = 0;
         if (sscanf(getenv("HOS_WINDOW_SIZE"), "%dx%d", &w, &h) == 2 && w >= 64 && h >= 64) win_w = w, win_h = h;
     }
-    window = hos_sdl_window(HOS_GAME_TITLE, win_w, win_h);
+    window = hos_sdl_window(window_title(HOS_GAME_TITLE), win_w, win_h);
     if (!window) {
         hos_log("display: SDL_CreateWindow: %s: no window", hos_sdl_error());
         fprintf(stderr, "display: SDL_CreateWindow: %s: no window\n", hos_sdl_error());
@@ -284,6 +297,11 @@ void hos_display_loop(void) {
     }
     if (getenv("HOS_FULLSCREEN") && atoi(getenv("HOS_FULLSCREEN"))) set_fullscreen(1);
     __atomic_store_n(&refresh_now, hos_sdl_refresh_mhz(window), __ATOMIC_RELAXED);
+    {   /* (the desktop's size, before the renderer starts: the Quality preset Auto (this PC) reads it once, desktop_size) */
+        int dw, dh;
+        if (hos_sdl_desktop_size(&dw, &dh))
+            __atomic_store_n(&desktop_w, dw, __ATOMIC_RELAXED), __atomic_store_n(&desktop_h, dh, __ATOMIC_RELAXED);
+    }
     pointer_update(0, 0);
     CloseHandle(CreateThread(NULL, 0, renderer_main, NULL, 0, NULL));
     DWORD refresh_asked = GetTickCount();

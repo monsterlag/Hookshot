@@ -67,7 +67,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> v(kFieldCount, "x");
     v[kWhere] = "";
     v[5] = mods_text({"a", "deep/b"});
-    v[7] = pipelines_text(n, true);
+    v[7] = pipelines_text(n, true, compute_count(bytes));
     const std::string z = share_zip(bytes, template_lines(v), (uint16_t)((2026 - 1980) << 9 | 11 << 5 | 11), 0);
     FILE* o = fopen(argv[3], "wb");
     fwrite(z.data(), 1, z.size(), o);
@@ -79,11 +79,18 @@ int main(int argc, char** argv) {
 
 
 def record(i, size=share.pipeline_states.SIZE2):
-    return struct.pack("<Q", i + 1) + bytes((i * 7 + k) & 0xFF for k in range(size - 8))
+    r = struct.pack("<Q", i + 1) + bytes((i * 7 + k) & 0xFF for k in range(size - 8))
+    # (a version 2 record's last two words: its kind, 0 for a pipeline, and padding)
+    return r[:-8] + bytes(8) if size == share.pipeline_states.SIZE2 else r
 
 
 def v2_list(n):
     return share.pipeline_states.MAGIC2 + struct.pack("<I", share.pipeline_states.SIZE2) + b"".join(record(i) for i in range(n))
+
+
+def with_computes(n, keys):
+    """A list of n pipelines and the compute programs keys, as the game writes them (vk_draw.cpp state_record_compute)"""
+    return v2_list(n) + b"".join(share.pipeline_states.compute_record(k) for k in keys)
 
 
 def game_folder(root, list_bytes=None):
@@ -141,6 +148,16 @@ def check_python(tmp):
     assert str(t) not in report and os.path.expanduser("~") not in report, "a path of the player's is in the report"
     assert sorted(os.listdir(out)) == [Path(path).name], "something besides the zip was left in the folder"
 
+    # a list that names the compute programs the play ran: sent with the pipelines, the bytes as they are, and counted in the report
+    both = with_computes(2, (0x1111, 0x2222, 0x3333))
+    (g / share.LIST).write_bytes(both)
+    path2, text2, n2 = share.make_zip(str(g), str(t / "out-computes"), day=share.datetime.date(2026, 11, 11))
+    with zipfile.ZipFile(path2) as z:
+        assert z.namelist() == [share.LIST, share.REPORT] and z.read(share.LIST) == both, "the compute records are not sent as written"
+        assert "compute programs your play ran" in z.read(share.REPORT).decode("utf-8")
+    assert n2 == 5 and "- Pipelines: 5 (version 2, 3 of them compute programs)" in text2.splitlines(), text2
+    assert share.pipeline_states.compute_keys(share.pipeline_states.read_sent(str(g / share.LIST))) == [0x1111, 0x2222, 0x3333]
+    (g / share.LIST).write_bytes(data)
     # the list is read once, and the bytes zipped are the bytes checked (a game appending between two reads changed them)
     src = (ROOT / "nx2" / "pipeline_share.py").read_text(encoding="utf-8")
     mz = src[src.find("def make_zip("):src.find("def main(")]
@@ -255,6 +272,16 @@ def check_cxx(cxx, tmp):
     assert [l.split(":")[0] for l in lines] == ["- " + f for f in share.FIELDS], lines
     assert "- %s:" % share.WHERE in lines and "- Mods or texture packs: a, deep/b" in lines and "- Pipelines: 5 (version 2)" in lines
     assert share.ISSUE_URL in report
+    # a list with compute records: the same bytes in the zip, the same Pipelines line as the Python's
+    both = with_computes(2, (0x1111, 0x2222, 0x3333))
+    (t / "both.bin").write_bytes(both)
+    assert run("zip", t / "both.bin", t / "both.zip").returncode == 0
+    with zipfile.ZipFile(t / "both.zip") as z:
+        assert z.read(share.LIST) == both, "the game's zip does not hold the compute records as written"
+        report = z.read(share.REPORT).decode("utf-8")
+    assert "- Pipelines: 5 (version 2, 3 of them compute programs)" in report.splitlines(), report
+    assert "- Pipelines: %s" % share.pipelines_text(share.pipeline_states.parse(both, "both", strict=True)) in report.splitlines()
+    assert "compute programs your play ran" in report
     # a list that is not one: no zip
     assert run("zip", t / "list-cut-short", t / "bad.zip").returncode != 0 and not (t / "bad.zip").exists()
     # the Output resolution line combined the same way (the Handheld profile, the game's own size, Ultrawide)
@@ -381,15 +408,20 @@ def check_drawn_only():
         if fn in draw:
             b = body_of(draw, fn)
             assert "state_record(" not in b and "graphics_pipeline(" not in b, fn + " can write the list"
-    # records are written in state_record() alone (state_open_locked writes a new list's header)
+    # records are written in state_record() alone (state_open_locked writes a new list's header), and a compute program's in
+    # state_record_compute(), which only dispatch() calls, at the program's first dispatch (tests/test_pipeline_state_computes.py)
     writes = [m.start() for m in re.finditer(r"fwrite\([^;]*state_file", draw)]
     spans = []
-    for fn in (r"\nvoid state_record\([^;{]*\) \{", r"\nvoid state_open_locked\(\) \{"):
+    for fn in (r"\nvoid state_record\([^;{]*\) \{", r"\nvoid state_open_locked\(\) \{", r"\nvoid state_record_compute\(uint64_t key\) \{"):
         m = re.search(fn, draw)
         assert m, fn
         spans.append((m.start(), draw.index("\n}\n", m.start())))
     assert writes and all(any(a <= w < b for a, b in spans) for w in writes), "the list is written outside state_record()"
     assert "fwrite(&r, sizeof r, 1, state_file)" in draw[spans[0][0]:spans[0][1]]
+    computes = [m.start() for m in re.finditer(r"(?<![\w:])state_record_compute\(", draw)]
+    d = body_of(draw, "void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t z, uint64_t indirect) {")
+    assert len(computes) == 2 and d.count("state_record_compute(p.key)") == 1, "a compute record is written outside dispatch()"
+    assert all("state_record_compute(" not in text for text in others.values()), "another file writes compute records"
 
 
 def check_linux_builder(tmp):

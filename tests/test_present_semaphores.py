@@ -148,8 +148,10 @@ struct PendingPresent {
     uint32_t index;
     uint64_t swapchain, swapchain_generation;
     uint64_t reflex_frame = ~0ull;   // (NVIDIA Reflex: the frame it shows; vk_reflex.h reflex_present_frame)
+    uint64_t antilag_frame = ~0ull;  // (AMD Anti-Lag 2: the same; vk_antilag.h antilag_present_frame)
 };
 thread_local uint64_t reflex_present_frame = ~0ull;   // (vk_reflex.cpp: the frame the present shows, kept around present_out)
+thread_local uint64_t antilag_present_frame = ~0ull;  // (vk_antilag.cpp: the same for AMD Anti-Lag 2)
 PendingPresent* present_defer_into=nullptr;
 unsigned committed=0, after_acquire=0;
 bool present_out(uint32_t, std::unique_lock<std::mutex>&) {++committed; return true;}

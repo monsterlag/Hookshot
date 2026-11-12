@@ -6,7 +6,8 @@ with the prompts' entries merged into it. On made-up tables, no game data:
 - merge_restbl, cut out of host/prompts.c: the mod's entries with the prompts' larger ones and those it lacks, hashed and
   named, sorted as the game's; tables it cannot merge refused (not a RESTBL, a wrong length, other name fields, out of order);
 - (Linux: host/posix's file calls) host/mods.c and host/prompts.c as they are, over real folders, with zstd's decoder: what the
-  game is served for the size table, the font and a mod's file with no mod, a mod with a table, a mod without one that grows
+  game is served for the size table, the font and a mod's file with no mod, a mod with a table, a mod with two versions'
+  tables (only the game's table name seeds the merge, whether the font or table is opened first), a mod without one that grows
   a file, two mods with tables (the one that sorts last is the base), a mod table that cannot be merged (served as it is, the
   game's own icons), no table of the prompts' (the mod's as it is, the icons kept), a mod with its own font (its font, the
   merged table), and, with the zstandard package, a table compressed as Clawshot writes it and one whose frame does not give
@@ -27,6 +28,7 @@ RUN_ALL_ARGS = ["--cc", "gcc"]
 
 ROOT = Path(__file__).resolve().parents[1]
 TABLE = "System/Resource/ResourceSizeTable.Product.111.Nin_Ounce_NVN2.rsizetable.zs"
+OTHER = "System/Resource/ResourceSizeTable.Product.110.Nin_Ounce_NVN2.rsizetable.zs"
 FONT = "Font2/Scalable/External.Nin_Ounce_NVN2.bfotf.zs"
 GROWN = "Banc/Test/Test_Static.bcett.byml.zs"
 ZSTD = ROOT / "third_party/zstd/lib"
@@ -180,13 +182,13 @@ POSIX_PIECES = ["static DWORD error_of(int e) {", "static void slashes(char *dst
                 "BOOL FindNextFileA(HANDLE h, WIN32_FIND_DATAA *fd) {", "BOOL FindClose(HANDLE h) {"]
 
 
-def routing_checks(cc, tmp, zstandard):
+def routing_checks(cc, tmp, zstandard, host):
     """mods.c and prompts.c as they are, over folders: what the game is served"""
     posix = (ROOT / "host/posix/win32_posix.c").read_text(encoding="utf-8")
     src = tmp / "src"
     src.mkdir(parents=True)
     for f in ("mods.c", "prompts.c"):   # (beside a hos.h of the test's: hos_log, and what the live prompts read: none here)
-        (src / f).write_bytes((ROOT / "host" / f).read_bytes())
+        (src / f).write_bytes((host / f).read_bytes())
     (src / "hos.h").write_text("#pragma once\n#include <stddef.h>\n#include <stdint.h>\nvoid hos_log(const char *f, ...);\n"
                                "#define HOS_WRITTEN(p, n) ((void)0)\n"
                                "static inline void *hos_guest_range(uint64_t a, uint64_t n) { (void)a; (void)n; return NULL; }\n"
@@ -217,16 +219,20 @@ DWORD GetModuleFileNameA(HMODULE m, LPSTR out, DWORD cap) { (void)m; return (DWO
     (tmp / "main.c").write_text(r'''#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 void hos_log(const char *f, ...) { va_list ap; va_start(ap, f); printf("log: "); vprintf(f, ap); printf("\n"); va_end(ap); }
 int hos_binding(int set, int button, int slot) { (void)set; (void)button; (void)slot; return -1; }
 int hos_sdl_pads(uint64_t *buttons, int32_t stick[4]) { (void)buttons; (void)stick; return 0; }
+int hos_xinput_pads(void) { return 0; } /* no controllers in this routing fixture */
 void hos_sdl_pad_first_name(char *out, size_t cap) { if (cap) *out = 0; }
 int hos_regions(uint64_t (*out)[2], int cap) { (void)out; (void)cap; return 0; }
 int64_t hos_now_ns(void) { return 0; }
 int rx_option(int id, int otherwise) { (void)id; return otherwise; }
 void hos_mods_init(const char *image_path);
 int hos_mods_romfs(const char *rel, char *out, size_t cap);
+const char *hos_romfs_dir;
 int main(int argc, char **argv) {
+    hos_romfs_dir = getenv("TEST_ROMFS");
     hos_mods_init(NULL);
     for (int i = 1; i < argc; i++) {
         char out[4096] = "";
@@ -249,6 +255,8 @@ int main(int argc, char **argv) {
         game = top / "game"
         (game / "prompts/xbox").mkdir(parents=True)
         (game / "hookshot_options.ini").write_text("button_prompts=2\n")   # (Xbox: no controller asked for)
+        (game / "romfs" / TABLE).parent.mkdir(parents=True)
+        (game / "romfs" / TABLE).write_bytes(frame(restbl(*GAME)))
         (game / "prompts/External.bfotf").write_bytes(struct.pack("<I", 0x18029A7F) + bytes(28))   # (every face's: one font)
         if ours is not None:
             (game / "prompts/rsizetable.zs").write_bytes(frame(ours))
@@ -257,7 +265,7 @@ int main(int argc, char **argv) {
             for rel, data in files.items():
                 (top / "mods" / folder / "romfs" / rel).parent.mkdir(parents=True, exist_ok=True)
                 (top / "mods" / folder / "romfs" / rel).write_bytes(data)
-        env = dict(os.environ, TEST_GAME_EXE=str(game / "hookshot"), HOS_MODS=str(top / "mods"))
+        env = dict(os.environ, TEST_GAME_EXE=str(game / "hookshot"), HOS_MODS=str(top / "mods"), TEST_ROMFS=str(game / "romfs"))
         out = subprocess.run([str(exe), *opens], env=env, check=True, capture_output=True, text=True, timeout=60).stdout
         served = {}
         for line in out.splitlines():
@@ -280,6 +288,17 @@ int main(int argc, char **argv) {
               "a mod with a table: %s\n%s" % (served, log))
         check(content == merged(MOD_B, OURS), "a mod with a table: the merged table's entries")
         check("with the button prompts' sizes merged in" in log and "1 entries raised or added" in log, "its log:\n" + log)
+    # Both tables are made up. The extra version sorts first in the old hash lookup.
+    version_errors = []
+    for i, opens in enumerate(((TABLE, FONT), (FONT, TABLE))):
+        served, content, log = case("versions-%d" % i, {"seed": {TABLE: frame(MOD_B), OTHER: frame(MOD_A)}}, opens=opens)
+        if served != {TABLE: "game/prompts/rsizetable.mod.zs", FONT: "game/prompts/External.bfotf.zs"}:
+            version_errors.append("two table versions, %s first: %s\n%s" % ("table" if i == 0 else "font", served, log))
+        if content != merged(MOD_B, OURS):
+            version_errors.append("two table versions, %s first: the merge is not the opened table's" % ("table" if i == 0 else "font"))
+        if "Product.110" in log:
+            version_errors.append("two table versions: the other one was read:\n" + log)
+    check(not version_errors, "\n".join(version_errors))
     # a mod without a table that grows a file: our table (its entry is still the game's), its file, the font
     served, _, log = case("grows", {"grown": {GROWN: frame(b"x" * 4096)}}, opens=(TABLE, GROWN, FONT))
     check(served == {TABLE: "game/prompts/rsizetable.zs", GROWN: mod_file.replace(TABLE, GROWN) % "grown",
@@ -300,7 +319,7 @@ int main(int argc, char **argv) {
     served, content, log = case("own-font", {"seed": {TABLE: frame(MOD_B), FONT: b"a mod's own font"}})
     check(served == {TABLE: "game/prompts/rsizetable.mod.zs", FONT: mod_file.replace(TABLE, FONT) % "seed"}
           and content == merged(MOD_B, OURS), "a mod with its own font: %s" % served)
-    n = 8
+    n = 10
     if zstandard:   # (Clawshot writes its table at level 19, with the frame's size: zstandard's default)
         served, content, log = case("level19", {"seed": {TABLE: zstandard.ZstdCompressor(level=19).compress(MOD_B)}})
         check(content == merged(MOD_B, OURS), "a compressed mod table: %s" % served)
@@ -309,16 +328,17 @@ int main(int argc, char **argv) {
         check(served == {TABLE: mod_file % "seed", FONT: "(the game's)"} and "not a zstd frame that gives its size" in log,
               "a frame without its size: %s" % served)
         n += 2
-    print("ok: %d cases served as they should: no mod, a mod with a table, one that grows a file without, two mods, a table "
-          "that cannot be merged, no table of ours, a mod's own font%s" % (n, ", compressed and size-less frames" if zstandard
-                                                                         else " (no zstandard: compressed frames not tried)"))
+    print("ok: %d cases served as they should: no mod, a mod with a table, two table versions in both open orders, "
+          "one that grows a file without, two mods, a table that cannot be merged, no table of ours, a mod's own font%s"
+          % (n, ", compressed and size-less frames" if zstandard else " (no zstandard: compressed frames not tried)"))
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--cc", default="gcc")
+    p.add_argument("--source", type=Path, default=ROOT / "host", help="host source directory to exercise")
     a = p.parse_args()
-    src = (ROOT / "host" / "prompts.c").read_text(encoding="utf-8")
+    src = (a.source / "prompts.c").read_text(encoding="utf-8")
     try:
         import zstandard
     except ImportError:
@@ -328,7 +348,7 @@ def main():
         if os.name == "nt" or sys.platform == "darwin":
             print("SKIP: the mods' and prompts' files over folders run on Linux (host/posix's file calls)")
             return
-        routing_checks(a.cc, Path(tmp) / "routing", zstandard)
+        routing_checks(a.cc, Path(tmp) / "routing", zstandard, a.source)
 
 
 if __name__ == "__main__":

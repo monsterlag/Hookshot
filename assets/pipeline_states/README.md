@@ -14,9 +14,16 @@ Hookshot's shader hashes; their notes say how. They hold the same records as any
 
   There are no shaders in it, only their hashes. A player's build turns those hashes back into shaders from the
   player's own `hookshot_shaders.bin`. `nx2/pipeline_states.py` documents the record layout.
+- **Compute programs:** a record can also name a compute program the game ran (culling, terrain, post-processing). It
+  holds the hash of that one shader and nothing else, because a compute pipeline has no formats or draw state. It is
+  the same on every GPU and with any settings. The tools count these as `compute` beside `graphics` and `mesh`.
 - **What it is for:** `nx2/make_game.py` merges every list here into the game folder's
   `hookshot_pipeline_states_shipped.bin`. The first start's shader preparation then builds these pipelines before the
-  title screen, so the first field load doesn't wash out white while they compile.
+  title screen, so the first field load doesn't wash out white while they compile. Every start also keeps the listed
+  compute programs' pipelines ready, together with the ones the player's own play has run, so a program is not set up
+  the first time the game runs it. `nx2/pipeline_states.py check` stops when the merged list names more than 1024
+  compute programs (`COMPUTE_MOST`): the game keeps memory for each one listed and never drops one itself, so raise
+  the number with a measurement or prune the list.
 
 ## The layout
 
@@ -46,7 +53,15 @@ pipeline list*) zips the game folder's `hookshot_pipeline_states.bin` with a fil
 (`hookshot_pipeline_report.txt`: the version, OS, GPU and driver, settings and mods), and nothing else. A maintainer then
 adds it as below, with the report's lines as `--gpu`, `--build`, `--settings` and `--route`. The zip is made by
 `gpu/vk/pipeline_share.h` in the game and `nx2/pipeline_share.py` in the builders, after the same checks as
-`nx2/pipeline_states.py --check`.
+`nx2/pipeline_states.py --check`. The list goes into the zip as the game wrote it, so the compute programs the player's
+game ran are in it, and the report's `Pipelines` line counts them. Lists from builds before the compute records hold
+none and are taken as before.
+
+**A sent list is someone else's file.** Never run or unpack anything else from a zip: take the one list out and give
+it to `nx2/pipeline_states.py --check`, then `add`. Both read it the same way and refuse it, writing nothing, unless
+it is exactly a list: at most 256 MB (as a file and unpacked), the magic and record size of a version this build
+reads, whole records with nothing after them, only record kinds this build knows, a compute record that holds its hash
+and nothing else, and no more than 8192 compute programs (more than the game has). A record's bytes are only compared and counted.
 
 With a clone:
 
@@ -54,7 +69,8 @@ With a clone:
    for.
 2. Move the game folder's `hookshot_pipeline_states.bin` aside if there is one. Play: every pipeline the game makes in
    play is added to that file. A run doesn't write the pipelines that the shipped list already built before the title,
-   so your list only holds what the current one misses. Play what the current lists miss, such as areas, dungeons,
+   so your list only holds what the current one misses. It does write every compute program the run used, and `add`
+   keeps the ones no other contributed list has. Play what the current lists miss, such as areas, dungeons,
    cutscenes, child and adult, or night.
 3. Add it, from the repository's root:
 

@@ -56,7 +56,12 @@ class CacheModuleCleanupTests(unittest.TestCase):
         if 'struct Reader {' not in serialization:   # (the Reader is vk_progcache.h's, shared with vk_shader.cpp)
             serialization = block(source, 'struct Reader {') + ';\n' + serialization
         functions += '\n' + serialization + block(source, 'void program_cache_save(')
+        functions += '\n' + block(source, 'bool program_cache_payload(')
         functions += '\n' + block(source, 'void program_cache_read(')
+        # (a compute program's variants read without their code, which program_cache_load does for a compute key:
+        # tests/test_program_cache_one_variant.py. These records are graphics programs', read whole)
+        if 'std::mutex light_mu;' in source:
+            functions += '\n' + source[source.index('namespace {\nstd::mutex light_mu;'):source.index('/// (shader_mu held) the kept variants of key go to its list')]
         functions += '\n' + block(source, 'void program_cache_load(')
         functions = functions.replace('bool keep) {', 'bool keep = false) {')   # (its default is in vk_progcache.h now)
         (directory / 'cache_types.inc').write_text(structs, encoding='utf-8')
@@ -95,6 +100,9 @@ class CacheModuleCleanupTests(unittest.TestCase):
 
     def test_valid_record_retains_modules(self):
         self.run_case('valid')
+
+    def test_compressed_record_round_trip(self):
+        self.run_case('compressed')
 
     def test_independent_records_continue(self):
         self.run_case('mixed')

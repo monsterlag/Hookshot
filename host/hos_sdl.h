@@ -73,6 +73,8 @@ void hos_sdl_pads_update(void);
 int hos_sdl_pad_button(void *pad, int button);
 int16_t hos_sdl_pad_axis(void *pad, int axis);
 const char *hos_sdl_pad_name(void *pad);
+/* Connection diagnostics only: hardware GUID and active mapping name, never a serial number or device path. */
+void hos_sdl_pad_log_connection(void *pad, int motion, int steam);
 int32_t hos_sdl_pad_id(void *pad);
 void hos_sdl_pad_rumble(void *pad, uint16_t low, uint16_t high, uint32_t ms);
 /* (HD rumble, host/pad_sdl.c) the pad's SDL_GetGamepadType / SDL_GameControllerGetType, in the loaded SDL's numbers (0

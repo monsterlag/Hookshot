@@ -96,6 +96,7 @@ static void player_used(void) {}
         # (the bound keys' helpers read_input calls: a mouse button counts only while the mouse is captured)
         block(hid, "static int mouse_vk_slot("), re.search(r"^static int mouse_armed\[5\];", hid, re.M).group(0),
         block(hid, "static void mouse_buttons_arm("), block(hid, "static int bound_down("),
+        block(hid, "static void oc_notes("), block(hid, "static uint64_t oc_pad_word("),
         block(hid, "static int flight_jump_shortcut("), read, block(hid, "static void npad_states(")))
     glue = (ROOT / "host/mkw_glue.c").read_text(encoding="utf-8")
     actual += "\n" + "\n".join(block(glue, "uint64_t " + name + "(")

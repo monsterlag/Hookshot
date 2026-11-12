@@ -47,7 +47,7 @@ class ProgramCacheIndexTests(unittest.TestCase):
     def test_index_checked_at_start(self):
         init = block(self.source, "void disk_init(")
         self.assertIn("is == stamp", init)                       # (the cache's stamp)
-        self.assertIn("at + 16 + (int64_t)size > whole", init)   # (sizes within the file)
+        self.assertIn("at + (int64_t)head_size + (int64_t)size > whole", init)   # (sizes within the file)
         self.assertIn("rec[0] == key && rec[1] == d.size", init)  # (the last record's head as the file has it)
         self.assertIn("order.clear()", init)                     # (not taken: all read as before)
         # the records past the index are read the old way, from where it ends
@@ -57,12 +57,12 @@ class ProgramCacheIndexTests(unittest.TestCase):
     def test_scan_size_unsigned(self):
         # (a record size past 2^63 was negative as int64_t and passed the old check: the scan went backwards)
         init = block(self.source, "void disk_init(")
-        self.assertIn("if (rec[1] > (uint64_t)(whole - good - 16)) break;", init)
+        self.assertIn("if (rec[1] > (uint64_t)(whole - (size_t)good - head_size)) break;", init)
         self.assertNotIn("good + 16 + (int64_t)rec[1] > whole", init)
 
     def test_head_checked_on_load(self):
         read = block(self.source, "void program_cache_read(")
-        self.assertIn("_fseeki64(in, d.at - 16, SEEK_SET)", read)
+        self.assertIn("_fseeki64(in, d.at - (int64_t)head_size, SEEK_SET)", read)
         self.assertIn("head[0] != key || head[1] != d.size", read)
 
     def test_parallel_reads(self):

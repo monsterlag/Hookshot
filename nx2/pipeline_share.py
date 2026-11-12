@@ -38,7 +38,8 @@ FIELDS = ("Hookshot version", "OS, GPU and driver", "Output resolution", "Upscal
           "Mods or texture packs", "Where you played (areas, dungeons, age, night/rain, ...)", "Pipelines")
 WHERE = FIELDS[6]
 NOTE = ("Attach this zip to a comment on %s and paste the lines below into it, with where you played filled in.\n"
-        "The zip holds only %s (shader hashes, formats and draw state: no game code, game data or personal info) and this text.\n"
+        "The zip holds only %s (shader hashes, formats and draw state, and the hashes of the compute programs your play ran: no game "
+        "code, game data or personal info) and this text.\n"
         % (ISSUE_URL, LIST))
 
 # (hookshot_options.ini's values as the menu names them: gpu/vk/vk_menu.cpp tx_upscaler, tx_framegen, tx_hdr, and
@@ -271,7 +272,15 @@ def details(folder, recs, log=None):
     gpu = gpu_text(folder, log)
     return [version_text(folder, log), "%s; %s" % (os_text(), gpu or "(GPU and driver: fill in)"), output_text(values),
             upscaler_text(values), framegen_hdr_text(values), mods_text(find_mods(folder)), "",
-            "%d (%s)" % (len(recs), "version 2" if recs and len(recs[0]) == pipeline_states.SIZE2 else "version 1")]
+            pipelines_text(recs)]
+
+
+def pipelines_text(recs):
+    """The Pipelines line: the count and the list's version, and how many of them are compute programs when it names any
+    (gpu/vk/pipeline_share.h pipelines_text). The list is zipped as it is: they go with the pipelines"""
+    computes = sum(pipeline_states.kind(r) == pipeline_states.COMPUTE for r in recs)
+    return "%d (%s%s)" % (len(recs), "version 2" if recs and len(recs[0]) == pipeline_states.SIZE2 else "version 1",
+                          ", %d of them compute programs" % computes if computes else "")
 
 
 def template(values):

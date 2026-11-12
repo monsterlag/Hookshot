@@ -4,7 +4,9 @@ An options file from before options_version 6 wrote ultrawide=0, the 16:9 that w
 On a screen narrower than 16:9 (16:10, the Steam Deck's 1280x800, 4:3) that moves to the monitor's shape, where 16:9 only adds
 bars; an ultrawide keeps its 16:9, and a file from version 6 on keeps whichever it says. No ultrawide= line is the monitor's
 shape. host/hos_main.c starts the game with hos_aspect_on, and the Insert menu's row follows what the host started with
-(gpu/vk/vk_menu.cpp menu_init), so the two agree on Linux too, where the menu has no screen size of its own.
+(gpu/vk/vk_menu.cpp menu_init), so the two agree on Linux too, where the menu has no screen size of its own. With
+HOS_ASPECT set (a debugging switch host/hos_main.c takes instead of the file) the menu does not move the row: the shape
+the host started with is the switch's, not the move's.
 
     python -I -B tests/test_aspect_default.py [--cc gcc]
 """
@@ -74,10 +76,11 @@ def main():
     menu = (ROOT / "gpu" / "vk" / "vk_menu.cpp").read_text(encoding="utf-8")
     init = menu[menu.index("void menu_init() {"):]
     init = init[:init.index("    restart_init();")]
-    need(init, r"if \(version < 6 && opts\.ultrawide == 0 && host && host->aspect_ratio\) \{\s*"
+    need(init, r"if \(version < 6 && opts\.ultrawide == 0 && !getenv\(\"HOS_ASPECT\"\) && host && host->aspect_ratio\) \{\s*"
                r"const float started = host->aspect_ratio\(\);\s*"
                r"if \(started > 1\.0f && started < 16\.0f / 9\.0f \* 0\.99f\) opts\.ultrawide = 1;",
-         "menu_init does not follow the host's start for an older file's 16:9 (before restart_init)")
+         "menu_init does not follow the host's start for an older file's 16:9 (before restart_init), "
+         "or follows it under HOS_ASPECT")
     saved = re.search(r'fprintf\(f, "options_version=(\d+)\\n"\);', menu[menu.index("void save() {"):])
     if not saved or int(saved.group(1)) < 6:
         raise SystemExit("FAIL: save() writes an options_version below 6: a 16:9 chosen now would move at the next start")

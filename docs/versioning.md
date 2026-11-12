@@ -176,14 +176,20 @@ the release pull request has no checks of its own: it changes only the changelog
 ## The nightly prerelease
 
 Every push to `main` also updates `nightly`, the latest development build. Once the Linux AppImage and Windows builder
-workflows have built that commit, their release jobs move the `nightly` tag to it and replace the files of the
-`nightly` prerelease with the same files a release has (`scripts/release_upload.sh nightly ...`), `SHA256SUMS` and
-the build provenance included. The notes name the commit and its date. It is a prerelease, never "latest", and not a
-version: `nightly` is not a `v*` tag, so release-please and `git describe` ignore it; the builders and the game read it only on the Nightly track. A
-run that finishes after a newer push leaves it alone. Its new parts go to `linux-parts` and `builder-parts`, like a
-release's. Its AppImage's update information names the `nightly` release instead of `latest`, so AppImageUpdate
-updates a nightly AppImage to the next nightly. (Gear Lever reads only `latest`, `latest-pre` and `latest-all`, and
-offers the latest release for any other name.)
+workflows have built that commit, their release jobs move the `nightly` tag to it and replace the files of the `nightly`
+prerelease with the same files a release has (`scripts/release_upload.sh nightly ...`), `SHA256SUMS` and the build
+provenance included. It is a prerelease, never "latest", and not a version: `nightly` is not a `v*` tag, so
+release-please and `git describe` ignore it; the builders and the game read it only on the Nightly track. The tag only
+moves forward: a run takes the nightly when its commit comes after the one the tag holds, even while newer pushes are
+still building, so it keeps up during a run of merges instead of waiting for `main` to be quiet. The tag is moved as a
+fast-forward, which GitHub refuses when the other platform's run has moved it past this commit meanwhile; a run of an
+older commit (or a re-run of an old one) leaves it alone. Each platform's files are one commit's and named by it (the
+AppImage and the RecompLauncher zip by their version, `hookshot-linux.txt` and `hookshot-setup.txt` by their tag, which
+is what each platform's updaters read), but the two builds finish at different times, so while `main` moves one
+platform's files can be a commit or two behind the other's; the tag is at the newest. Its new parts go to `linux-parts`
+and `builder-parts`, like a release's. Its AppImage's update information names the `nightly` release instead of
+`latest`, so AppImageUpdate updates a nightly AppImage to the next nightly. (Gear Lever reads only `latest`,
+`latest-pre` and `latest-all`, and offers the latest release for any other name.)
 
 ## The rc prerelease
 

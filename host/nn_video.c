@@ -15,6 +15,9 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <emmintrin.h>
+#endif
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #ifdef _WIN32
@@ -115,6 +118,7 @@ typedef struct {
     Picture queue[MAX_QUEUE];
     int qhead, qn;
     int eos;                         /* the last submission is in and decoded: an empty queue is the end */
+    int stopped;                     /* (hookshot) Stop or Flush since the last submission: no picture is coming (dec_acquire) */
     Pending *phead, *ptail;          /* submissions not decoded yet, oldest first */
     int64_t submits, acquires;
     int clock_set;                   /* (hookshot) the movie's clock: the picture at clock_pts was due at clock_ns */
@@ -315,7 +319,7 @@ static void dec_init_sized(Ctx *c, enum AVCodecID id, const char *what, int w, i
     InitializeSRWLock(&d->lock);
     if (codec) {
         d->ctx = avcodec_alloc_context3(codec);
-        d->ctx->thread_count = id == AV_CODEC_ID_AV1 ? 4 : 2;   /* (1080p AV1 in software) */
+        d->ctx->thread_count = id == AV_CODEC_ID_AV1 ? 8 : 4;   /* (1080p AV1 in software) */
         if (avcodec_open2(d->ctx, codec, NULL) < 0) avcodec_free_context(&d->ctx);
     }
     for (size_t i = 0; !d->ctx && !d->mf && id == AV_CODEC_ID_AV1 && i < sizeof av1_decoders / sizeof av1_decoders[0]; i++)
@@ -367,41 +371,64 @@ static void dec_finalize(Ctx *c) {
     free(d);
     set_host(ARG(0), DEC_MAGIC, NULL);
 }
-/* a decoded frame into the queue, as RGBA and NV12 (the oldest dropped when the reader falls behind) */
+/* a decoded frame into the queue as NV12, deferring RGBA to pool_rgba() unless eager conversion is forced */
 static void queue_frame(Dec *d, const AVFrame *f) {
     const int w = f->width, h = f->height;
     if (w <= 0 || h <= 0) return;
-    if (f->format != AV_PIX_FMT_NV12 && (!d->sws || d->sws_w != w || d->sws_h != h || d->sws_fmt != f->format)) {
+    const int nv12_src = f->format == AV_PIX_FMT_NV12;
+    const int yuv420 = f->format == AV_PIX_FMT_YUV420P || f->format == AV_PIX_FMT_YUVA420P;
+    const char *rgba_env = getenv("HOS_VIDEO_RGBA");
+    const int force_rgba = rgba_env && atoi(rgba_env) != 0;
+    const int lazy_rgba = !force_rgba && (nv12_src || yuv420);
+    if (!lazy_rgba && (!d->sws || d->sws_w != w || d->sws_h != h || d->sws_fmt != f->format)) {
         if (d->sws) sws_freeContext(d->sws);
         d->sws = sws_getContext(w, h, (enum AVPixelFormat)f->format, w, h, AV_PIX_FMT_RGBA, SWS_BILINEAR, NULL, NULL, NULL);
         d->sws_w = w, d->sws_h = h, d->sws_fmt = f->format;
     }
     Picture p = {0};
     p.w = w, p.h = h, p.pts = f->pts;
-    const int nv12 = f->format == AV_PIX_FMT_NV12;   /* (hookshot: Media Foundation's pictures, kept as NV12 alone) */
-    p.rgba = nv12 ? NULL : (uint8_t *)malloc((size_t)w * h * 4);
-    p.nv12 = nv12 ? (uint8_t *)malloc((size_t)w * h * 3 / 2) : (uint8_t *)calloc(1, (size_t)w * h * 3 / 2);
-    if (!p.nv12 || (!nv12 && !p.rgba)) {   /* (out of memory: this frame is dropped, not written through NULL; issue 342) */
+    const size_t nv12_size = (size_t)w * h * 3 / 2;
+    p.rgba = lazy_rgba ? NULL : (uint8_t *)malloc((size_t)w * h * 4);
+    p.nv12 = (uint8_t *)malloc(nv12_size);
+    if (!p.nv12 || (!lazy_rgba && !p.rgba)) {   /* (out of memory: this frame is dropped, not written through NULL; issue 342) */
         static volatile LONG told;
         if (InterlockedIncrement(&told) <= 4) hos_log("video: no memory for a %dx%d frame: dropped", w, h);
         free(p.rgba), free(p.nv12);
         return;
     }
+    if ((w | h) & 1) memset(p.nv12, 0, nv12_size);
     uint8_t *dst[4] = {p.rgba, NULL, NULL, NULL};
     int dst_stride[4] = {w * 4, 0, 0, 0};
     if (d->sws && p.rgba) sws_scale(d->sws, (const uint8_t *const *)f->data, f->linesize, 0, h, dst, dst_stride);
-    if (nv12) {
+    if (nv12_src) {   /* (hookshot: Media Foundation's pictures) */
         for (int y = 0; y < h; y++) memcpy(p.nv12 + (size_t)y * w, f->data[0] + (size_t)y * f->linesize[0], (size_t)w);
         for (int y = 0; y < h / 2; y++)
             memcpy(p.nv12 + (size_t)w * h + (size_t)y * w, f->data[1] + (size_t)y * f->linesize[1], (size_t)w);
-    } else if (f->format == AV_PIX_FMT_YUV420P || f->format == AV_PIX_FMT_YUVA420P) {   /* (planar 4:2:0 -> NV12) */
+    } else if (yuv420) {   /* (planar 4:2:0 -> NV12) */
         for (int y = 0; y < h; y++) memcpy(p.nv12 + (size_t)y * w, f->data[0] + (size_t)y * f->linesize[0], (size_t)w);
         uint8_t *uv = p.nv12 + (size_t)w * h;
-        for (int y = 0; y < h / 2; y++)
-            for (int x = 0; x < w / 2; x++) {
-                uv[(size_t)y * w + 2 * x] = f->data[1][(size_t)y * f->linesize[1] + x];
-                uv[(size_t)y * w + 2 * x + 1] = f->data[2][(size_t)y * f->linesize[2] + x];
+        const uint8_t *u_src = f->data[1], *v_src = f->data[2];
+        const int u_stride = f->linesize[1], v_stride = f->linesize[2];
+        for (int y = 0; y < h / 2; y++) {
+            const uint8_t *u_row = u_src + (size_t)y * u_stride;
+            const uint8_t *v_row = v_src + (size_t)y * v_stride;
+            uint8_t *uv_row = uv + (size_t)y * w;
+            int x = 0;
+#if defined(__x86_64__) || defined(_M_X64)
+            for (; x + 16 <= w / 2; x += 16) {
+                __m128i u16 = _mm_loadu_si128((const __m128i *)(u_row + x));
+                __m128i v16 = _mm_loadu_si128((const __m128i *)(v_row + x));
+                _mm_storeu_si128((__m128i *)(uv_row + 2 * x), _mm_unpacklo_epi8(u16, v16));
+                _mm_storeu_si128((__m128i *)(uv_row + 2 * x + 16), _mm_unpackhi_epi8(u16, v16));
             }
+#endif
+            for (; x < w / 2; x++) {
+                uv_row[2 * x] = u_row[x];
+                uv_row[2 * x + 1] = v_row[x];
+            }
+        }
+    } else {
+        memset(p.nv12, 0, nv12_size);
     }
     if (d->qn == MAX_QUEUE) {
         picture_free(&d->queue[d->qhead]);
@@ -586,6 +613,7 @@ static void dec_submit(Ctx *c) {
         }
     }
     d->submits++;
+    d->stopped = 0;   /* (hookshot: pictures are coming again: dec_acquire waits for one as before) */
     if (ARG(5) & 1) pending_push(d, NULL);
     const int logged_one = d->log_submits > 0;
     if (logged_one) d->log_submits--;
@@ -612,6 +640,7 @@ static void dec_flush(Ctx *c, const char *what) {
         d->qhead = d->qn = 0;
         d->eos = 0;
         d->clock_set = 0;
+        d->stopped = 1;   /* (hookshot: until the next submission, dec_acquire has nothing to wait for) */
         for (int i = 0; i < MAX_SLOTS; i++) d->slot_last[i] = 0;
         ReleaseSRWLockExclusive(&d->lock);
     }
@@ -642,7 +671,14 @@ static void dec_acquire(Ctx *c) {
     const int away = hos_vcore_away();
     AcquireSRWLockExclusive(&d->lock);
     decode_pending(d);
-    for (int tries = 0; !d->qn && !d->eos && tries < 50; tries++) {
+    /* (hookshot) The wait is for a picture another thread's submission is about to bring, ~100 ms of it. It was 50 tries of a
+       2 ms sleep, and such a sleep takes 4-5 ms: 245-257 ms, on the thread a movie's end joins (title to game: the game's main
+       thread in hos_thread_join for a frame of ~250 ms, every start). Now by the clock, and none after a Stop or a Flush with
+       nothing submitted since: no picture is coming then. HOS_VIDEO_ACQUIRE_TRIES=1: 50 tries, as before */
+    static int by_tries = -1;
+    if (by_tries < 0) by_tries = env_on("HOS_VIDEO_ACQUIRE_TRIES");
+    const int64_t wait_until = hos_now_ns() + 100000000;
+    for (int tries = 0; !d->qn && !d->eos && (by_tries ? tries < 50 : !d->stopped && hos_now_ns() < wait_until); tries++) {
         ReleaseSRWLockExclusive(&d->lock);
         hos_sleep_ns(2000000);
         AcquireSRWLockExclusive(&d->lock);

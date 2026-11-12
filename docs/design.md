@@ -84,6 +84,17 @@ message. OoT-specific code goes into new files where it can, so the shared files
   SPIR-V, mesh/task programs with `VK_EXT_mesh_shader`. The WebGPU renderer (`gpu/render`) stays in the Windows exe as the
   fallback when Vulkan is missing, as in mkw-recomp, when the build has wgpu-native (`WGPU_NATIVE`).
 
+### Graphics pipeline state
+
+The mesh compute fallback draws its generated records through a vertex shader without vertex buffers.
+Its graphics pipelines keep dynamic primitive topology and primitive restart, but do not require a
+dynamic vertex binding stride (#2494, tracked in #1001). Ordinary vertex-input pipelines still use
+dynamic stride; native mesh pipelines do not use these three input-assembly/vertex-input states.
+Binding the fallback's static-stride pipeline invalidates dynamic strides. The draw path drops both
+vertex-bind skip caches at that bind, so the next ordinary draw sets its strides again even if the
+buffers are unchanged. Resolved buffer references remain cached; buffer handles, offsets and sizes
+are not invalidated by pipeline binding. Runtime fallback programs do not use pipeline libraries.
+
 ## 4. The lessons from MKW, as rules here
 
 Each of these cost days in mkw-recomp; the fork has the fixes, and these are the checks that keep them true for a

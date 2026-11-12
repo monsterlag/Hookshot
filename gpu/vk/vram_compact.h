@@ -25,6 +25,28 @@ inline bool pressed(uint64_t used, uint64_t allowed) { return allowed && used > 
 /// into what a run gave back while the next one waits: under a 9.8 GB allowance the count reached 10.2 GB with 1.1-1.6 GB free
 inline uint64_t run_from(uint64_t min_free, bool is_pressed) { return is_pressed ? std::min<uint64_t>(min_free, 192ull << 20) : min_free; }
 
+/// The blocks a pool starts with (#2438: each block made in play is a vkAllocateMemory on the replay thread, ~170 ms on AMD's
+/// Windows driver): 15% of the card's memory, 2 to 24, in the pool the sampled textures are made in (holds_textures) and in no
+/// other. They were the images' pool's, where the textures went when #2438 was measured; compacted, the textures have a pool of
+/// their own, and the images' pool is left DLSS's, the frame interpolation's and the scratch images. There the blocks stayed
+/// empty: the driver counted them (1152 MB on an 8 GB card), no texture could take them, so reclaimable() rightly left them in
+/// the count and the hold cut the texture budget by as much (#2690: an RTX 3070 in Castle Town Market, 31-36 fps against 54-56
+/// without them), and the textures' blocks were made in play as before. In the textures' pool the scene's textures fill them,
+/// and what they hold free is that pool's free space, which the budget takes off the count already
+inline uint64_t blocks_at_start(uint64_t heap, uint64_t block, bool holds_textures) {
+    return holds_textures && block ? std::clamp<uint64_t>(heap / 100 * 15 / block, 2, 24) : 0;
+}
+
+/// The free space of the textures' pool a run can give back: not what the blocks made at the start hold (kept), which VMA
+/// keeps whatever is in them. Counted, a scene with fewer textures than those blocks hold started a run every time one was due
+inline uint64_t returnable(uint64_t block_bytes, uint64_t free_bytes, uint64_t kept) {
+    return std::min(free_bytes, block_bytes - std::min(block_bytes, kept));
+}
+
+/// Whether the textures' pool is down to its blocks made at the start. VMA keeps those, so nothing an eviction frees comes off
+/// the driver's count: the rule that squeezes by the count alone (97% of the allowance) waits, as it does for room in the blocks
+inline bool kept_only(uint64_t block_bytes, uint64_t kept) { return kept && block_bytes <= kept; }
+
 /// The presents between the end of a run and the next look
 inline uint64_t rest(bool is_pressed) { return is_pressed ? 120 : 600; }
 
@@ -67,6 +89,21 @@ inline uint64_t reserve_pct(uint64_t pct) { return pct > kReservePoints ? pct - 
 /// to on their own: 7/8 of their budget once the textures hold more than it, as a pass over the budget cuts with the compaction
 /// off; UINT64_MAX: nothing
 inline uint64_t rule_target(uint64_t total, uint64_t rule_budget) { return total > rule_budget ? rule_budget / 8 * 7 : UINT64_MAX; }
+
+/// The same, with the budget's size (size_budget) told from what the 90% rule and the driver's limit made of it (rule_budget,
+/// never more). Those two are not sizes: each is "what the textures hold less the excess over a line", as the hold's is, and is
+/// crossed again whenever anything grows. Cut to 7/8 of it, a few MB over the line took an eighth of the cache: Castle Town
+/// Market entered from Hyrule Field on an 8 GB card sat 60 MB over the 90% line and lost ~400 MB of textures unused for a
+/// second, all on screen again within the camera's turn, made again, over the line again: 2.5 <-> 2.95 GB every few seconds,
+/// 8-9 uploads a frame and 16-25 frames over 50 ms in 30 s, where the same scene loaded from a save (just under the line) had
+/// none. So for them what goes is the excess and kExcessSlack more, so that not every pass is one; the budget's size still asks
+/// for its 7/8
+inline constexpr uint64_t kExcessSlack = 64ull << 20;
+inline uint64_t rule_target(uint64_t total, uint64_t size_budget, uint64_t rule_budget) {
+    uint64_t to = rule_target(total, size_budget);
+    if (rule_budget < size_budget && total > rule_budget) to = std::min(to, rule_budget - std::min(rule_budget, kExcessSlack));
+    return to;
+}
 
 /// What a live texture unused for that many presents may be let go down to in the hold's pass, the lowest of the lines that
 /// apply to it; UINT64_MAX: it stays. Three tiers:

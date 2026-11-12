@@ -29,7 +29,7 @@ def main():
     parser.add_argument("--headers", required=True)
     args = parser.parse_args()
     source = (ROOT / "gpu/vk/vk_draw.cpp").read_text(encoding="utf-8")
-    reader = function(source, "std::vector<uint8_t> pcache_file_read(const std::string& path)")
+    reader = function(source, "PipelineCacheFile pcache_file_read(const std::string& path)")
     fixture = r'''
 #define _CRT_SECURE_NO_WARNINGS   /* (Windows: fopen is not deprecated here) */
 #include <cstdint>
@@ -46,8 +46,21 @@ def main():
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr,"FAIL:%d %s\n",__LINE__,#x); std::exit(1); } } while (0)
 struct { VkPhysicalDeviceProperties props; } dev;
 static size_t bytes_read;
-static size_t counted_fread(void* p, size_t s, size_t n, FILE* f) { const size_t r = std::fread(p, s, n, f); bytes_read += r * s; return r; }
-#define fread counted_fread
+#ifdef _WIN32
+#include <windows.h>
+static BOOL counted_read(HANDLE h, void* p, DWORD n, DWORD* got, OVERLAPPED* o) {
+    BOOL result = ReadFile(h, p, n, got, o); if (result) bytes_read += *got; return result;
+}
+#define ReadFile counted_read
+#else
+#include <unistd.h>
+static ssize_t counted_read(int fd, void* p, size_t n, off_t offset) {
+    ssize_t result = pread(fd, p, n, offset); if (result > 0) bytes_read += (size_t)result; return result;
+}
+#define pread counted_read
+#endif
+#include "pipeline_cache_file.h"
+using mkwvk::PipelineCacheFile;
 ''' + reader + r'''
 static std::vector<uint8_t> cache(uint32_t vendor, uint32_t device, uint8_t uuid0, size_t body, uint32_t head_size = 32) {
     std::vector<uint8_t> d(32 + body);
@@ -66,7 +79,8 @@ static std::vector<uint8_t> roundtrip(const std::string& path, const std::vector
     std::fwrite(d.data(), 1, d.size(), f);
     std::fclose(f);
     bytes_read = 0;
-    return pcache_file_read(path);
+    auto mapped = pcache_file_read(path);
+    return mapped.empty() ? std::vector<uint8_t>{} : std::vector<uint8_t>(mapped.data(), mapped.data() + mapped.size());
 }
 int main(int argc, char** argv) {
     CHECK(argc == 2);
@@ -95,7 +109,7 @@ int main(int argc, char** argv) {
     with tempfile.TemporaryDirectory() as d:
         src, exe = Path(d) / "t.cpp", Path(d) / "t"
         src.write_text(fixture, encoding="utf-8")
-        subprocess.run([args.cxx, "-std=c++20", "-Wall", "-Wextra", "-Werror", "-I", args.headers, str(src), "-o", str(exe)],
+        subprocess.run([args.cxx, "-std=c++20", "-Wall", "-Wextra", "-Werror", "-I", args.headers, "-I", str(ROOT / "gpu/vk"), str(src), "-o", str(exe)],
                        check=True)
         subprocess.run([str(exe), str(Path(d) / "cache.bin")], check=True)
     print("ok")

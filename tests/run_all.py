@@ -349,7 +349,23 @@ def compile_all():
     return Result(1 if bad else 0, text.encode())
 
 
+def unicode_output():
+    """A failed check's output is printed whole, and compilers and tests write quotes, arrows and U+FFFD (from the
+    "replace" decode). Into a pipe (CI's log, an agent's tool, `| more`) Windows' Python writes the ANSI code page,
+    cp1252, which has none of them: the run stopped with a UnicodeEncodeError at the first such failure, before the
+    table, the summary and --write-times. A pipe gets UTF-8, as -X utf8 would give it; a console keeps its own encoding.
+    Either way a character it cannot show is replaced instead of ending the run (as scripts/team_chat.py does)."""
+    for stream in (sys.stdout, sys.stderr):
+        if not hasattr(stream, "reconfigure"):   # (a StringIO)
+            continue
+        if stream.isatty():
+            stream.reconfigure(errors="replace")
+        else:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 def main():
+    unicode_output()
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("names", nargs="*")
     p.add_argument("--jobs", type=int, default=os.cpu_count() or 2)

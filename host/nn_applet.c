@@ -122,8 +122,8 @@ static int handheld(void) {
 /* (hookshot) The Insert menu's Output resolution (output_res=, HOS_OUTPUT_RES over it), docked only: a size, "<width>x<height>",
    each side a multiple of 8 (rounded down to one), at least 640 x 360, at most 5120 x 2880's pixels (the largest the render
    targets' pool, hos_rt_pool_size, was played at) and between 5:4 and 48:9 in shape (host/hos_main.c's screen shapes); anything
-   else is the game's own size, said in the log. The menu offers 1920x1080, 2048x1152, 2560x1440, 3840x2160, 5120x1440 and
-   5120x2880, and any other size as its own choice. The numbers it saved before are read as their sizes: 0 the game's
+   else is the game's own size, said in the log. The menu offers 2048x1152 and the screen's display modes (gpu/vk/display_modes.h;
+   where they are not known 1920x1080, 2560x1440, 3840x2160, 5120x1440 and 5120x2880), and any other size as its own choice. The numbers it saved before are read as their sizes: 0 the game's
    2048 x 1152, 1 2560 x 1440, 2 3840 x 2160, 3 1920 x 1080, 4 5120 x 1440, 5 5120 x 2880. The game's frame is its display size
    (2560 x 1440 as shipped; nx2/oot_patches.py apply_output_size asks hos_output_size) times its graphics scale
    (GetCurrentGraphicsScale: 0 x1, 1 x0.8, 2 x0.667). Here it saw scale 1 (x0 left at the call before's answer), so 2048 x 1152,

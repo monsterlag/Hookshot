@@ -57,11 +57,17 @@ typedef struct HosControlGame {
     int (*destination)(int index, const char **child, const char **adult);
     /* (OoT) a teleport there asked for, taken at the player's next update (in play): a ticket (> 0), 0 no such
        destination. A later ask replaces one not taken yet. teleport_result: 1 sent (map: the map it goes to; accepted: the
-       game's event manager took the request), -1 refused (why: the game's reason), 0 not taken yet, -2 replaced or
-       cancelled. teleport_cancel: not to be taken any more */
+       game's event manager took the request), -1 refused (why: the game's reason), 2 (the age switch) Link was that age
+       already and nothing was done, 0 not taken yet, -2 replaced or cancelled. teleport_cancel: not to be taken any more */
     int (*teleport)(int index);
     int (*teleport_result)(int ticket, char *why, size_t why_cap, char *map, size_t map_cap, int *accepted);
     void (*teleport_cancel)(int ticket);
+    /* (OoT) the Debug tab's Switch age to the adult (1) or the child (0) asked for: taken at the player's next update as a
+       teleport is, and done as the menu does it (Link's age flipped, the map reloaded in the other age through the
+       teleport) unless Link is that age when it is taken (teleport_result 2, nothing done). A ticket in the teleport's
+       numbering (> 0), read with teleport_result (map: the map it reloads) and dropped with teleport_cancel; a later
+       teleport or age ask replaces one not taken yet. 0: not asked */
+    int (*age)(int adult);
     /* (OoT) with the map: an event playing (a cutscene, a map change's), a map loading, Link the child. 0 before any */
     int (*oot_state)(int *event, int *loading, int *child);
 } HosControlGame;

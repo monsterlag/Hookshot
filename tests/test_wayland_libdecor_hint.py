@@ -78,7 +78,8 @@ def main():
     if not cxx:
         raise SystemExit("C++ compiler not found: " + args.cxx)
     display = (args.source_root / "host/posix/display_sdl.c").read_text(encoding="utf-8")
-    actual = function(display, "int hos_display_init(void)")
+    # Initialization uses the title helper even though this fixture creates no window.
+    actual = function(display, "static const char *window_title(") + "\n\n" + function(display, "int hos_display_init(void)")
     flags = subprocess.CREATE_NO_WINDOW | subprocess.BELOW_NORMAL_PRIORITY_CLASS if os.name == "nt" else 0
     env = dict(os.environ)
     env["PATH"] = str(Path(cxx).parent) + os.pathsep + env.get("PATH", "")

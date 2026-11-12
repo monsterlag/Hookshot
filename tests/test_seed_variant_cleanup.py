@@ -34,7 +34,10 @@ class SeedVariantCleanupTests(unittest.TestCase):
         header = (ROOT / 'gpu/vk/vk_shader.h').read_text(encoding='utf-8')
         structs = '\n'.join(block(header, marker) + ';' for marker in ('struct Stage {', 'struct Program {'))
         (directory / 'seed_types.inc').write_text(structs, encoding='utf-8')
-        function = block(SOURCE.read_text(encoding='utf-8'), 'const Program* seed_variant_of(')
+        source = SOURCE.read_text(encoding='utf-8')
+        # (seed_variant_of hands its questions and answers to seed_variant_made, which seed_plain_of shares: both)
+        markers = ['static const Program* seed_variant_made('] if 'seed_variant_made(' in source else []
+        function = '\n\n'.join(block(source, m) for m in markers + ['const Program* seed_variant_of('])
         (directory / 'seed_function.inc').write_text(function, encoding='utf-8')
         cls.executable = directory / 'check.exe'
         fixture = ROOT / 'tests/seed_variant_cleanup_test.cpp'

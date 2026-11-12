@@ -30,7 +30,7 @@ class NgxRuntimeTests(unittest.TestCase):
         (self.out / "bin").mkdir(parents=True)
         self.ngx = make_game.ngx_script()
 
-    def sdk_files(self, platform, runtime=True):
+    def sdk_files(self, platform, runtime=True, framegen=True):
         lib = Path(self.ngx.library(str(self.sdk), platform))
         lib.parent.mkdir(parents=True, exist_ok=True)
         lib.write_bytes(b"lib")
@@ -38,18 +38,25 @@ class NgxRuntimeTests(unittest.TestCase):
             rt = Path(self.ngx.runtime(str(self.sdk), platform))
             rt.parent.mkdir(parents=True, exist_ok=True)
             rt.write_bytes(b"runtime")
+            if framegen:
+                Path(self.ngx.runtime(str(self.sdk), platform, "framegen")).write_bytes(b"framegen")
 
-    def place(self, platform, sdk=None):
+    def place(self, platform, sdk=None, said=None):
         env = {"HOOKSHOT_NGX_SDK": str(self.sdk) if sdk is None else sdk}
         with mock.patch.object(make_game, "LINUX", platform == "linux"), mock.patch.dict(os.environ, env), \
-                mock.patch("sys.stdout", io.StringIO()):
-            return make_game.place_ngx_runtime(str(self.out))
+                mock.patch("sys.stdout", io.StringIO()) as out:
+            dst = make_game.place_ngx_runtime(str(self.out))
+        if said is not None:
+            said.append(out.getvalue())
+        return dst
 
     def test_windows_runtime_goes_to_the_ngx_folder(self):
         self.sdk_files("windows")
         dst = self.place("windows")
         self.assertEqual(Path(dst), self.out / "ngx" / "nvngx_dlss.dll")
         self.assertEqual(Path(dst).read_bytes(), b"runtime")
+        # (DLSS Frame Generation's runtime beside it, where NGX looks before the driver's own copy)
+        self.assertEqual((self.out / "ngx" / "nvngx_dlssg.dll").read_bytes(), b"framegen")
         self.assertEqual(sorted(p.name for p in self.out.iterdir()), ["bin", "ngx"])
         self.assertEqual(list((self.out / "bin").iterdir()), [])   # (nothing beside the exe)
         self.assertFalse([p for p in self.out.rglob("*") if p.name.lower() == "_nvngx.dll"])
@@ -85,12 +92,21 @@ class NgxRuntimeTests(unittest.TestCase):
     def test_linux_runtime(self):
         self.sdk_files("linux")
         self.assertEqual(Path(self.place("linux")), self.out / "ngx" / "libnvidia-ngx-dlss.so.310.9.16")
+        self.assertTrue((self.out / "ngx" / "libnvidia-ngx-dlssg.so.310.9.16").is_file())
 
     def test_rebuilding_without_dlss_removes_stale_runtime(self):
         self.sdk_files("linux")
         self.assertTrue((Path(self.place("linux"))).is_file())
         self.assertIsNone(self.place("linux", sdk=""))
-        self.assertFalse((self.out / "ngx").exists())
+        self.assertFalse((self.out / "ngx").exists())   # (both runtimes gone, and the folder)
+
+    def test_an_older_sdk_folder_says_how_to_get_frame_generations_runtime(self):
+        self.sdk_files("windows", framegen=False)
+        said = []
+        self.assertEqual(Path(self.place("windows", said=said)), self.out / "ngx" / "nvngx_dlss.dll")
+        self.assertEqual([p.name for p in (self.out / "ngx").iterdir()], ["nvngx_dlss.dll"])
+        self.assertIn("has no nvngx_dlssg.dll yet", said[0])
+        self.assertIn("scripts/ngx_sdk.py", said[0])
 
     def test_nothing_without_the_sdk_or_its_platform(self):
         self.assertIsNone(self.place("windows", sdk=""))
@@ -286,7 +302,8 @@ class LinuxBuilderDlssTests(unittest.TestCase):
 
     def test_build_and_appimage_package_dlss_sources(self):
         build_py = (ROOT / "nx2" / "build.py").read_text(encoding="utf-8")
-        self.assertIn('vk_prebuilt = "" if NGX_SDK else os.environ.get("HOOKSHOT_VK_PREBUILT", "")', build_py)
+        self.assertIn('return "" if NGX_SDK else os.environ.get("HOOKSHOT_VK_PREBUILT", "")', build_py)
+        self.assertIn('vk_prebuilt = prebuilt_renderer()', build_py)
         appimage = (ROOT / "scripts" / "linux" / "appimage.sh").read_text(encoding="utf-8")
         for piece in ("cp scripts/ngx_sdk.py", "cp -a gpu/vk gpu/compat gpu/third_party", "third_party/imgui", "libstdc++.a"):
             self.assertIn(piece, appimage)

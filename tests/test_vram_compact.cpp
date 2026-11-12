@@ -56,6 +56,15 @@ int main() {
     CHECK(rule_target(5600 * MB, 6144 * MB) == UINT64_MAX);                        // (under the budget: they ask nothing)
     CHECK(rule_target(5600 * MB, 5600 * MB) == UINT64_MAX);
     CHECK(rule_target(5600 * MB, 5300 * MB) == 5300 * MB / 8 * 7);                 // (over it: cut to 7/8 of it, as ever)
+    // told apart: the budget's size still asks for its 7/8; the 90% rule's and the limit's budgets ask for their excess and
+    // kExcessSlack more (the Market on an 8 GB card: 2,873 MB of textures, 62 MB over the line)
+    CHECK(rule_target(2873 * MB, 3285 * MB, 3285 * MB) == UINT64_MAX);             // (no rule asks anything)
+    CHECK(rule_target(2873 * MB, 3285 * MB, 2811 * MB) == 2811 * MB - kExcessSlack);   // (the excess: 126 MB go, not 413)
+    CHECK(rule_target(2873 * MB, 3285 * MB, 2811 * MB) > rule_target(2873 * MB, 2811 * MB));
+    CHECK(rule_target(2873 * MB, 2560 * MB, 2560 * MB) == 2560 * MB / 8 * 7);      // (over its size: 7/8 of it, as before)
+    CHECK(rule_target(2873 * MB, 2560 * MB, 2500 * MB) == 2560 * MB / 8 * 7);      // (both: the lower of the two)
+    CHECK(rule_target(2873 * MB, 2880 * MB, 2200 * MB) == 2200 * MB - kExcessSlack);
+    CHECK(rule_target(100 * MB, 3285 * MB, 32 * MB) == 0);                         // (never under nothing)
     CHECK(hold_target(100, 60, 4637 * MB, 5000 * MB, 4500 * MB) == 4637 * MB);     // (the count over 90%: one unused 100 presents still goes)
     CHECK(hold_target(59, 60, 4637 * MB, 5000 * MB, 4500 * MB) == UINT64_MAX);     // (one used in the last 60: never)
     CHECK(hold_target(100, 120, 4637 * MB, 5000 * MB, 4500 * MB) == UINT64_MAX);   // (nor before the pass's own time, whatever that is)

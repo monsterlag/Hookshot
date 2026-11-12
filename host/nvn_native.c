@@ -1028,6 +1028,7 @@ static int set_shaders(nvn_prog *o, int n, const uint8_t *sd, int stride) {
         }
     }
     o->serial = new_serial();
+    rx_nvn_program_created(o);   /* (the stages are in memory now: the back end loads what it kept ready for them) */
     return 1;
 }
 NV(nvnProgramSetShaders) { RET(set_shaders((nvn_prog *)P(0), I(1), (const uint8_t *)P(2), 16)); }

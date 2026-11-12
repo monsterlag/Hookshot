@@ -196,18 +196,15 @@ int hos_mods_romfs(const char *rel, char *out, size_t cap) {
     return 1;
 }
 
-/* prompts.c: the mod file (out) whose key (lower case, '/') starts with prefix and ends with suffix, 1 with one */
-int hos_mods_find(const char *prefix, const char *suffix, char *out, size_t cap) {
-    const size_t pn = strlen(prefix), sn = strlen(suffix);
-    for (size_t i = 0; i < table_cap; i++) {
-        const char *k = table[i].key;
-        const size_t kn = k ? strlen(k) : 0;
-        if (k && !table[i].is_dir && kn >= pn + sn && !strncmp(k, prefix, pn) && !strcmp(k + kn - sn, suffix)) {
-            snprintf(out, cap, "%s", table[i].host);
-            return 1;
-        }
-    }
-    return 0;
+/* prompts.c: the mod file for this exact RomFS path, before the prompts' replacements */
+int hos_mods_file(const char *rel, char *out, size_t cap) {
+    char key[MAX_PATH];
+    snprintf(key, sizeof key, "%s", rel);
+    lower_slash(key);
+    const Entry *e = table_n ? find(key) : NULL;
+    if (!e || e->is_dir) return 0;
+    snprintf(out, cap, "%s", e->host);
+    return 1;
 }
 
 /* nn_fs.c, listing a RomFS folder: fn(arg, name, is_dir, size) for each mod entry directly in it that the game's own

@@ -108,7 +108,51 @@ def main():
         check("a finished lift with another key is not", not make_game.lifted_before(str(work), "0" * 40))
     check_lift_sources()
     check_compile_only()
+    check_key_after_lift()
     print("ok: the lift key follows the game, the tools (the modules the lift imports), the hot list, the chunks and the settings")
+
+
+def check_key_after_lift():
+    """A fresh work folder has no image/hot_pieces.txt until its first lift's split_hot writes one, and the key hashes it: the key
+    the lift is stored under is taken after the lift, from what the next build reads, or that build translates the game again
+    (a no-op rebuild of a new work folder: 319 s on Windows, 290 s of it the lift). make_game.py's translate(), read as text"""
+    src = (ROOT / "nx2" / "make_game.py").read_text(encoding="utf-8")
+    body = src[src.index("    def translate():"):src.index("\n    translate()\n")]
+    split = body.index('"nx2/split_hot.py"')
+    again = body.find("after = lift_key(exefs, work, env)", split)
+    write = body.find("write_lift_key(work, key)", split)
+    check("the key is taken again after the lift and split_hot, then written", split < again < write)
+    check("translate() sets the build's key, which keep_translation uses after the build", "nonlocal key" in body)
+    start = body.find("inputs = lift_key(exefs, work, env, planning=False)")
+    lift = body.index('"nx2/lift.py"')
+    guard = body.find("if lift_key(exefs, work, env, planning=False) == inputs:", split)
+    taken = body.find("key = after", guard)
+    check("what the lift reads and does not write is taken as it starts", 0 <= start < lift)
+    check("the key taken after the lift is kept only if that did not change while it ran", split < guard < taken < write)
+    check("the key is taken before that comparison, so an edit between the two is caught by it", again < guard)
+    with tempfile.TemporaryDirectory(prefix="hookshot-lift-key-after-") as d:
+        d = Path(d)
+        exefs, work = d / "exefs", d / "work"
+        exefs.mkdir()
+        (work / "image").mkdir(parents=True)
+        (exefs / "main").write_bytes(b"NSO0 one")
+        env = {"A64_HOT_CHUNK": "1"}
+        with mock.patch.dict(os.environ, {k: v for k, v in os.environ.items() if not k.startswith(("A64_", "OOT_", "RX_"))}, clear=True):
+            before = make_game.lift_key(str(exefs), str(work), env)
+            (work / "image" / "hot_pieces.txt").write_text("f_80000000 1\n")   # (what the first lift's split_hot leaves)
+            after = make_game.lift_key(str(exefs), str(work), env)
+            check("a fresh folder's key before its first lift is not the next build's", before != after)
+            check("the key after the lift is the next build's", after == make_game.lift_key(str(exefs), str(work), dict(env)))
+            inputs = make_game.lift_key(str(exefs), str(work), env, planning=False)
+            (work / "image" / "hot_pieces.txt").write_text("f_80000004 1\n")
+            (work / "image" / "chunks.txt").write_text("80003000\n")
+            check("the lift's own files are not among the other inputs", make_game.lift_key(str(exefs), str(work), env, planning=False)
+                  == inputs)
+            (exefs / "main").write_bytes(b"NSO0 two")
+            check("the game's code is", make_game.lift_key(str(exefs), str(work), env, planning=False) != inputs)
+            (exefs / "main").write_bytes(b"NSO0 one")
+            (work / "hot_funcs.txt").write_text("f_80000004\n")
+            check("the hot list is", make_game.lift_key(str(exefs), str(work), env, planning=False) != inputs)
 
 
 def check_lift_sources():
@@ -129,7 +173,7 @@ def check_lift_sources():
     check("the lift's scripts import (%s)" % run.stderr.strip()[-2000:], run.returncode == 0)
     out = run.stdout
     tops = (str(ROOT / "nx2") + os.sep, str(ROOT / "third_party" / "a64-kit") + os.sep)
-    loaded = {f for f in out.split() if f.startswith(tops)}
+    loaded = {f for f in out.splitlines() if f.startswith(tops)}   # (lines: a path may hold a space)
     check("the lift loads its modules (%d)" % len(loaded), len(loaded) > 12 and str(ROOT / "nx2" / "chunks.py") in loaded)
     sources = {os.path.abspath(f) for f in make_game.lift_sources()}
     missing = sorted(loaded - sources)

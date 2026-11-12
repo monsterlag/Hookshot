@@ -87,11 +87,12 @@ void hos_vcore_back(void) {
 static void AcquireSRWLockExclusive(SRWLOCK *l) { l->locked = 1; }
 static void ReleaseSRWLockExclusive(SRWLOCK *l) { l->locked = 0; }
 /* hos_sleep_ns as host/hos_thread.c has it: the core given up for the sleep, if one is held */
+static int64_t sleep_takes_ns;   /* (what a sleep really takes, when not what was asked: a 2 ms sleep takes 4-5 ms) */
 static void hos_sleep_ns(int64_t ns) {
     sleeps++;
     sleeps_with_core += held;
     const int away = hos_vcore_away();
-    clock_ns += ns;
+    clock_ns += sleep_takes_ns ? sleep_takes_ns : ns;
     if (away) hos_vcore_back();
 }
 static Pool pool;
@@ -104,6 +105,7 @@ static void picture_free(Picture *p) { free(p->rgba), free(p->nv12); memset(p, 0
 /* the decoding (libavcodec and dav1d's waits in the real one): one picture per submission, after `late` calls */
 static Pending one;
 static int late, end_after;
+static int stopped_now;   /* (the decoder was stopped or flushed and nothing was submitted since) */
 static void decode_next(Dec *d) {
     decodes++;
     decodes_with_core += held;
@@ -131,6 +133,7 @@ static uint64_t acquire(int core, int pending, int registered) {
     if (!pool.nv12) pool.w = pool.h = 4, pool.count = 1, pool.nv12 = (uint8_t *)calloc(1, 4 * 4 * 3 / 2);
     dec.slots[0] = registered ? 2 : 0;
     dec.phead = dec.ptail = pending ? &one : NULL;
+    dec.stopped = stopped_now;
     Ctx c;
     memset(&c, 0, sizeof c);
     c.x[0] = (uint64_t)(uintptr_t)&index, c.x[1] = (uint64_t)(uintptr_t)&sync, c.x[2] = 1;
@@ -163,6 +166,24 @@ int main(void) {
 
     r = acquire(0, 1, 1);
     check(r == 0 && held == 0 && takes == 0, "a thread that held no core takes none");
+
+    /* the wait for a picture another thread's submission may bring: ~100 ms by the clock, whatever a sleep takes, and none
+       after a Stop or a Flush (a movie's end: the thread its teardown joins sat here for 245-257 ms) */
+    r = acquire(1, 0, 1);
+    check(r == 0 && sleeps == 50 && sleeps_with_core == 0, "nothing decoded yet: 100 ms of 2-ms sleeps, then the buffer again");
+    sleep_takes_ns = 5000000;
+    const int64_t before = clock_ns;
+    r = acquire(1, 0, 1);
+    check(r == 0 && sleeps == 20 && clock_ns - before == 100000000, "sleeps that take 5 ms: still 100 ms, not 50 tries (250 ms)");
+    stopped_now = 1;
+    r = acquire(1, 0, 1);
+    check(r == 0 && sleeps == 0 && dec.acquires == 1, "stopped and nothing submitted since: no wait, the buffer again at once");
+    check(takes == 1 && takes_under_lock == 0 && held == 1, "and the core back after the lock");
+    stopped_now = 0, sleep_takes_ns = 0;
+    late = 3;
+    r = acquire(1, 1, 1);
+    check(r == 0 && sleeps == 3, "a pending submission is still waited for");
+    late = 0;
     if (!bad) puts("ok");
     return bad;
 }

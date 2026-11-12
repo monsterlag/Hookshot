@@ -3,7 +3,8 @@
 # Built in Ubuntu 22.04, the oldest system it is for (glibc 2.35). A workflow artifact on every run; for a release, also
 # an asset of its release (scripts/release_upload.sh, shared with the Windows builder workflow). A release is a tag
 # pushed by hand, or the tag the Release workflow passes when it calls this one (inputs.tag). On any other push to main,
-# the same files replace those of the nightly prerelease, the latest development build.
+# the same files replace those of the nightly prerelease, the latest development build, when its commit comes after the
+# one the nightly holds.
 name: Linux AppImage
 on:
   push:
@@ -30,13 +31,15 @@ env:
   RELEASE_TAG: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name || '') }}
 concurrency:
   group: linux-appimage-${{ inputs.tag || github.ref }}
-  # (a pull request's older run is cancelled; a push's or a tag's never is)
+  # (a pull request's older run is cancelled; a push's or a tag's never is. One run of main at a time, and one waiting,
+  # replaced by a newer push's: scripts/release_upload.sh counts on it, so this platform's nightly files never go back)
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   appimage:
     # (builder-parts holds the installer's parts: no AppImage there, and it must never be made "latest")
-    # (nightly is moved by the release job of a push to main, and rc by the Release workflow: never built as a tag)
+    # (nightly is moved forward by the release job of a push to main, here or in the Windows builder workflow, and rc by
+    # the Release workflow: never built as a tag)
     if: >-
       github.ref_name != 'builder-parts' && github.ref_name != 'linux-parts' && github.ref_name != 'nightly'
       && github.ref_name != 'rc'

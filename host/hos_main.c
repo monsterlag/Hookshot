@@ -272,18 +272,25 @@ static int is_link(const char *p) {
     struct stat st;
     return lstat(p, &st) == 0 && S_ISLNK(st.st_mode);
 }
-static const char *move_old, *move_new;   /* (the user folder on the move, as realpath names it, and the new place) */
+static const char *move_old, *move_from, *move_new;   /* (the user folder on the move, as realpath names it and as given, and the new place) */
+static int moved_to(char *target, const char *dir) {   /* (a target under dir: named where it will be) */
+    char there[MAX_PATH];
+    const size_t n = dir && dir[0] == SEP ? strlen(dir) : 0;
+    if (!n || strncmp(target, dir, n) || target[n] != SEP) return 0;
+    snprintf(there, sizeof there, "%s%s", move_new, target + n);
+    snprintf(target, MAX_PATH, "%s", there);
+    return 1;
+}
 static int copy_link(const char *from, const char *to) {   /* (to what it names, in full; one that names nothing: as written) */
-    char target[MAX_PATH], there[MAX_PATH];
-    const size_t old = move_old ? strlen(move_old) : 0;
+    char target[MAX_PATH];
     if (!realpath(from, target)) {
         const ssize_t n = readlink(from, target, sizeof target - 1);
         if (n < 0) return 0;
         target[n] = 0;
-    } else if (old && !strncmp(target, move_old, old) && target[old] == SEP) {   /* (to an entry that moves too: where it will be) */
-        snprintf(there, sizeof there, "%s%s", move_new, target + old);
-        snprintf(target, sizeof target, "%s", there);
     }
+    /* (to an entry that moves too: where it will be. One whose entry went first names nothing by now, so its text is
+       checked too: else it named the old place, and only when the folder listed it before the entry) */
+    if (!moved_to(target, move_old)) moved_to(target, move_from);
     return symlink(target, to) == 0;
 }
 static int has_link(const char *p) {
@@ -373,7 +380,7 @@ static const char *saves_dir(const char *beside) {
     snprintf(pattern, sizeof pattern, "%s" SEP_S "*", beside);
     int moved = 0, kept = 0;
     char real[MAX_PATH];
-    move_old = realpath(beside, real), move_new = dir;
+    move_old = realpath(beside, real), move_from = beside, move_new = dir;
     /* (looked at first, then moved: with an entry the new place has already, the old place is kept, and it keeps them all.
        The others used to go all the same, and the game then ran here without them) */
     for (int move = 0; move < 2 && !kept; move++) {
@@ -641,6 +648,7 @@ static const unsigned char oot_item_kinds[] = {OOT_CHEAT_ITEMS(OOT_NO_SECTION, O
 static int oot_item_count(Ctx *c, const char *name);
 static int oot_gamedata_bool(Ctx *c, uint32_t hash, int *value);
 static int oot_gamedata_set_bool(Ctx *c, uint32_t hash, int value);
+static int oot_gamedata_string(Ctx *c, uint32_t hash, char *buf, size_t size);
 
 static void oot_inventory_refresh(Ctx *c, int64_t now) {
     void rx_option_set(int id, int value);
@@ -657,6 +665,17 @@ static void oot_inventory_refresh(Ctx *c, int64_t now) {
     {   /* Link's age for the Debug tab's Switch age row: 0 child, 1 adult, -1 no save loaded (Sequence_IsChildhood) */
         int child = 1;
         rx_option_set(OOT_CHEAT_AGE_ID, loaded && oot_gamedata_bool(c, 0xcea220d3u, &child) ? (child ? 0 : 1) : -1);
+    }
+    if (loaded) {   /* the map Link is in and his age, logged when either changes: where a log's problem happened, the "Where in
+                       the game" of the Insert menu's Bug report (gpu/vk/vk_bug_report.cpp reads the last of these lines) */
+        static char logged[100];
+        char map[80], line[100];
+        int child = 1;
+        if (oot_gamedata_string(c, 0x1d6189dau, map, sizeof map) && map[0]) {   /* Sequence_CurrentBanc */
+            snprintf(line, sizeof line, "%s (%s)", map,
+                     oot_gamedata_bool(c, 0xcea220d3u, &child) ? (child ? "child" : "adult") : "age not known");
+            if (strcmp(line, logged)) hos_log("map: %s", line), snprintf(logged, sizeof logged, "%s", line);
+        }
     }
     if (!probed && oot_pouch_count(c, "Item_DekuSeed") >= 0) {
         probed = 1;   /* (one line naming every count, both spellings: which names the pouch knows) */
@@ -986,14 +1005,24 @@ static int oot_teleport(Ctx *c, uint64_t actor, unsigned index) {
         release_link(c);
     }
     *c = saved;
-    /* (issue 2217) An area that hides the minimap while Link is in it sets MapIconDeactivateByAreaActor, which is saved,
-       and shows the minimap again as he walks out. This map change takes him out without that: the flag stayed set, and
-       no area had a minimap from then on, in that save and every one made from it. Cleared once the event manager takes the
-       request (0: it did not, and Link stays); the map he arrives in sets it again where it hides its own. A save it is
-       already stuck in is mended by its next teleport. */
+    /* (issues 2217, 2588) A map-hiding area can leave this saved flag set when a debug teleport skips its exit.
+       Only clear it once the event manager takes the request; the destination may hide its own minimap.
+       Use the game's Bool setter (mgr, value, hash): it queues the change for the live value AND the save's copy.
+       Writing only the live byte restores the HUD until the next load, but saves keep the old hidden value. */
     int hidden = 0;
-    if (ok && result && oot_gamedata_bool(c, 0x9a4dd779u, &hidden) && hidden && oot_gamedata_set_bool(c, 0x9a4dd779u, 0))
-        hos_log("cheats: teleport: the area left had hidden the minimap (MapIconDeactivateByAreaActor): shown again");
+    if (ok && result && oot_gamedata_bool(c, 0x9a4dd779u, &hidden) && hidden) {
+        A64Fn set_bool = a64_lookup(0x806a2b20ULL);
+        const uint64_t mgr = oot_singleton(c, OOT_GAMEDATA_SLOT);
+        if (set_bool && mgr) {
+            c->x[0] = mgr, c->x[1] = 0, c->x[2] = 0x9a4dd779u;   /* MapIconDeactivateByAreaActor */
+            set_bool(c);
+            *c = saved;
+            hos_log("cheats: teleport: the area left had hidden the minimap (MapIconDeactivateByAreaActor): restore queued");
+        } else {   /* (another game build: say so, a report's log then shows why the minimap stayed away) */
+            hos_log("cheats: teleport: the area left had hidden the minimap (MapIconDeactivateByAreaActor): %s not found, left hidden",
+                    set_bool ? "the game data manager" : "the game's Bool setter");
+        }
+    }
     teleport.requested_at = now;
     teleport.check_at = now + 1500000000LL;
     teleport.destination = index;
@@ -1027,12 +1056,14 @@ static int oot_gamedata_set_bool(Ctx *c, uint32_t hash, int value) {
 }
 
 /* Age toggle: flips Sequence_IsChildhood (what the Temple of Time event sets) and reloads the current map, or the
-   Market when this map is not in oot_destinations, through the teleport so the other age's map and Link load. */
-static void oot_toggle_age(Ctx *c, uint64_t actor) {
+   Market when this map is not in oot_destinations, through the teleport so the other age's map and Link load. 1: the map
+   change was sent (teleport.banc its map); 0: not, teleport.why says why (the control bridge's reply) */
+static int oot_toggle_age(Ctx *c, uint64_t actor) {
     int child = 1;
     if (!oot_gamedata_bool(c, 0xcea220d3u, &child)) {
         hos_log("cheats: age toggle: Sequence_IsChildhood not found");
-        return;
+        teleport.why = "Link's age is not in the game's data (Sequence_IsChildhood not found)", teleport.banc = NULL;
+        return 0;
     }
     char current[80];
     oot_gamedata_string(c, 0x1d6189dau, current, sizeof current);   /* Sequence_CurrentBanc */
@@ -1047,14 +1078,17 @@ static void oot_toggle_age(Ctx *c, uint64_t actor) {
     }
     if (!oot_gamedata_set_bool(c, 0xcea220d3u, !child)) {
         hos_log("cheats: age toggle: could not write Sequence_IsChildhood");
-        return;
+        teleport.why = "Link's age could not be written (Sequence_IsChildhood)", teleport.banc = NULL;
+        return 0;
     }
     hos_log("cheats: age toggle: %s -> %s, reloading via destination %u (current map \"%s\")",
             child ? "child" : "adult", child ? "adult" : "child", target, current);
     if (!oot_teleport(c, actor, target)) {
         oot_gamedata_set_bool(c, 0xcea220d3u, child);
         hos_log("cheats: age toggle undone, the map change was not requested");
+        return 0;
     }
+    return 1;
 }
 
 static void oot_teleport_followup(Ctx *c) {
@@ -1114,11 +1148,13 @@ int hos_oot_destination(int index, const char **child, const char **adult) {
 }
 /* The bridge's teleport: asked on its thread, taken at the player's next update (oot_bridge_teleport_take), and what came
    of it kept for the bridge, by ticket. A later ask replaces one not taken yet. (oot_map_lock) */
+#define OOT_BRIDGE_AGE 0x10000   /* (oot_bridge_tp.asked: the age switch to the child, | 1 to the adult; not a destination) */
 static struct {
-    int asked;    /* the destination + 1 waiting to be taken; 0 none */
+    int asked;    /* the destination + 1 waiting to be taken, OOT_BRIDGE_AGE | adult the age switch; 0 none */
     int ticket;   /* the last ask's */
     int taking;   /* the ticket taken by the player's update and not done yet (it is not replaced meanwhile) */
-    int done_ticket, result, accepted;   /* the last one taken: 1 sent, -1 refused; accepted: the event manager's answer */
+    int done_ticket, result, accepted;   /* the last one taken: 1 sent, -1 refused, 2 (the age switch) Link was that age
+                                            already; accepted: the event manager's answer */
     char why[96], map[80];
 } oot_bridge_tp;
 int hos_oot_teleport_ask(int index) {
@@ -1129,8 +1165,19 @@ int hos_oot_teleport_ask(int index) {
     ReleaseSRWLockExclusive(&oot_map_lock);
     return ticket;
 }
+/* The bridge's age switch to the adult (1) or the child (0): the Debug tab's Switch age (oot_toggle_age), asked and taken as
+   a teleport is, with the same tickets, result and cancel. The age wanted goes with it and is checked when it is taken (the
+   bridge's sample of Link's age can be old): already that age, nothing is done (result 2) */
+int hos_oot_age_ask(int adult) {
+    AcquireSRWLockExclusive(&oot_map_lock);
+    const int ticket = ++oot_bridge_tp.ticket;
+    __atomic_store_n(&oot_bridge_tp.asked, OOT_BRIDGE_AGE | (adult ? 1 : 0), __ATOMIC_RELAXED);
+    ReleaseSRWLockExclusive(&oot_map_lock);
+    return ticket;
+}
 /* 1 sent (map: the map it goes to; accepted: whether the game's event manager took the request), -1 refused (why: the
-   reason), 0 not taken yet (or being taken), -2 replaced by a later ask or cancelled */
+   reason), 2 (the age switch) Link was that age already, nothing done, 0 not taken yet (or being taken), -2 replaced by a
+   later ask or cancelled */
 int hos_oot_teleport_result(int ticket, char *why, size_t why_cap, char *map, size_t map_cap, int *accepted) {
     AcquireSRWLockShared(&oot_map_lock);
     int r = -2;
@@ -1157,8 +1204,14 @@ static int oot_bridge_teleport_take(int *ticket) {   /* (the player's update) th
     ReleaseSRWLockExclusive(&oot_map_lock);
     return asked;
 }
-static void oot_bridge_teleport_done(int ticket, int sent) {
+static void oot_bridge_teleport_done(int ticket, int sent) {   /* sent: 1, 0 refused (teleport.why), 2 already that age */
     AcquireSRWLockExclusive(&oot_map_lock);
+    if (sent == 2) {
+        oot_bridge_tp.done_ticket = ticket, oot_bridge_tp.result = 2, oot_bridge_tp.taking = 0, oot_bridge_tp.accepted = 0;
+        oot_bridge_tp.why[0] = oot_bridge_tp.map[0] = 0;
+        ReleaseSRWLockExclusive(&oot_map_lock);
+        return;
+    }
     oot_bridge_tp.done_ticket = ticket, oot_bridge_tp.result = sent ? 1 : -1, oot_bridge_tp.taking = 0;
     oot_bridge_tp.accepted = sent && teleport.result != 0;
     snprintf(oot_bridge_tp.why, sizeof oot_bridge_tp.why, "%s", sent || !teleport.why ? "" : teleport.why);
@@ -1243,10 +1296,12 @@ static void oot_update_player_cheats(Ctx *c, uint64_t actor, uint64_t components
     last_player_tick = now;
     int action = rx_option(HOS_OPT_CHEAT_ACTION, 0);
     if (!action) action = __atomic_exchange_n(&hos_oot_live_action, 0, __ATOMIC_RELAXED);
-    int bridge_ticket = 0;   /* (the control bridge's teleport, host/control.c: what came of it is kept for its reply) */
+    int bridge_ticket = 0;   /* (the control bridge's teleport or age switch, host/control.c: what came of it is kept for its reply) */
+    int bridge_adult = -1;   /* (the bridge's age switch: the age wanted, 1 the adult) */
     if (!action) {
         const int asked = oot_bridge_teleport_take(&bridge_ticket);
-        if (asked) action = OOT_TELEPORT_ACTION + asked - 1;
+        if (asked & OOT_BRIDGE_AGE) action = OOT_AGE_ACTION, bridge_adult = asked & 1;
+        else if (asked) action = OOT_TELEPORT_ACTION + asked - 1;
     }
     oot_teleport_followup(c);
     oot_inventory_refresh(c, now);
@@ -1255,7 +1310,14 @@ static void oot_update_player_cheats(Ctx *c, uint64_t actor, uint64_t components
     if (action >= OOT_CHEAT_ITEM_ACTION && action < OOT_CHEAT_ITEM_ACTION + 256 * (int)OOT_ITEM_COUNT) {
         oot_inventory_edit(c, action);
     } else if (action == OOT_AGE_ACTION) {
-        oot_toggle_age(c, actor);
+        int child = 1;   /* (the bridge's: Link's age now, not its sample's; already the age wanted, nothing to flip) */
+        if (bridge_adult >= 0 && oot_gamedata_bool(c, 0xcea220d3u, &child) && !child == bridge_adult) {
+            hos_log("cheats: age toggle: Link is the %s already", child ? "child" : "adult");
+            oot_bridge_teleport_done(bridge_ticket, 2);
+        } else {
+            const int sent = oot_toggle_age(c, actor);
+            if (bridge_ticket) oot_bridge_teleport_done(bridge_ticket, sent);
+        }
     } else if (action >= OOT_TELEPORT_ACTION) {
         const int sent = oot_teleport(c, actor, (unsigned)(action - OOT_TELEPORT_ACTION));
         if (bridge_ticket) oot_bridge_teleport_done(bridge_ticket, sent);
@@ -1403,6 +1465,82 @@ void hos_oot_flight_pose(Ctx *c, uint64_t actor, uint64_t matrix) {
 #endif
 }
 
+/* The new-game opening, build e0f3ccfaf50065ae4ea01eb5aeb13b1a45da3348. Sequence/Opening.module.ainb requests
+   Opening_Introduction and Opening_LoadingKokiriForest (SeqOneShotRequestEvent, f_80d9a820; the event name is the
+   pointer at the request arg + 6800, which that function reads). Opening_Introduction's flowchart writes the state
+   on both paths: the clock at 6:00, Meet_DekuTree's challenge Step01, the forest terrain pin, then
+   EventTransition of the timeline Dm_Kokiri_0030. Its own skip query (IsEventSkipedMostRecent, f_80de6cb0) then
+   takes the short edge: Navi warped to the position that edge names, the in-game music, Navi's talked flag, the
+   camera handed back, and an autosave. Opening_LoadingKokiriForest's flowchart plays the timeline Dm_Kokiri_0000
+   and then waits until the forest banc has loaded. Neither timeline writes save data. Meet_DekuTree is a later
+   flow and is not one of these names.
+
+   With Skip opening on, the request is still sent, so the flowchart applies that edge. The two timelines are not
+   started: f_83b5bfb0 is their only starter (EventTransition at 0x80eaba00). Leaving bit 0 of the timeline player
+   + 0xf25 clear makes that caller take its own exit at 0x80eac5e0, which finishes the action node, instead of the
+   exit at 0x80eac640 that leaves the timeline running. The skip query is answered yes only while one of these two
+   requests is the current one, so the short edge runs and a title demo that uses the same query does not. The
+   cutscene frame counter is not moved. mode 0 observes a request, 1 a timeline start (return 1: do not start it),
+   2 the skip query (return 1: x0 is 1), 3 Link is updating and no event is playing (the opening has let him go). */
+int hos_oot_opening(Ctx *c, int mode) {
+    int rx_option(int id, int otherwise);
+    static int armed;
+    static char logged[64];
+    char name[80];
+    uint64_t p = 0;
+    if (mode == 3) {
+        armed = 0;
+        logged[0] = 0;
+        return 0;
+    }
+    if (!c || rx_option(HOS_OPT_SKIP_OPENING, 0) <= 0) {
+        armed = 0;
+        return 0;
+    }
+    name[0] = 0;
+    if (mode == 0) {
+        const uint64_t arg = c->x[1];
+        p = arg ? recomp_load64(c, arg + 6800) : 0;
+    } else if (mode == 1 && c->x[1]) {
+        p = recomp_load64(c, c->x[1]);   /* EventTransition passes a pointer to the timeline's name */
+    }
+    if (p) {
+        size_t i = 0;
+        for (; i + 1 < sizeof name; i++) {
+            name[i] = (char)recomp_load8(c, p + i);
+            name[i + 1] = 0;
+            if (!name[i]) break;
+        }
+    }
+    if (mode == 0) {
+        if (!strcmp(name, "Opening_Introduction") || !strcmp(name, "Opening_LoadingKokiriForest")) {
+            armed = 1;
+            if (strcmp(logged, name)) {
+                size_t i = 0;
+                for (; name[i] && i + 1 < sizeof logged; i++) logged[i] = name[i];
+                logged[i] = 0;
+                hos_log("opening skip: %s request sent", name);
+            }
+        } else if (name[0]) {
+            /* a different event (Meet_DekuTree included) is not skipped and drops the arm */
+            armed = 0;
+            logged[0] = 0;
+        }
+        return 0;   /* the request is still sent */
+    }
+    if (!armed) return 0;
+    if (mode == 2) {
+        c->x[0] = 1;
+        return 1;
+    }
+    if (mode == 1 && (!strcmp(name, "Dm_Kokiri_0000") || !strcmp(name, "Dm_Kokiri_0030"))) {
+        const uint64_t player = c->x[0];
+        if (player) recomp_store8(c, player + 0xf25, recomp_load8(c, player + 0xf25) & ~(uint64_t)1);
+        return 1;
+    }
+    return 0;
+}
+
 void hos_oot_lift_player(Ctx *c, uint64_t actor) {
 #if defined(_WIN32) || defined(__linux__)   /* (the debug tools: host/posix has what they call) */
     flight_pose_actor = 0;
@@ -1411,6 +1549,7 @@ void hos_oot_lift_player(Ctx *c, uint64_t actor) {
     const uint64_t movement = components ? recomp_load64(c, components + 800) : 0;
     if (movement < HOS_HEAP_BASE + 0x1d50 || recomp_load64(c, movement + 24) != actor ||
         !hos_oot_is_player(c, movement - 0x1d50)) return;
+    if (!oot_event_playing(c)) hos_oot_opening(c, 3);   /* the opening has let Link go: later events keep their own skip */
 
     // Link can be updated by different guest workers on successive frames.
     static SRWLOCK cheats_lock = SRWLOCK_INIT;
@@ -1753,7 +1892,7 @@ static int game_main(int argc, char **argv) {
     {   /* (hookshot) Widescreen and ultrawide (nx2/oot_wide.py): HOS_ASPECT=<ratio> (2.3889 for 3440x1440), else the Insert menu's
            Aspect ratio (on unless it says 0) takes the main monitor's shape. The game's picture takes that shape at its own height (the
            world wider at the sides on an ultrawide screen, narrower on a 16:10 or 4:3 one), its 16:9 cameras the picture's ratio.
-           A custom output wider than 32:9 takes precedence over both HOS_ASPECT and the Aspect ratio, matching the menu's picture. Wider
+           An output that is not 16:9 takes precedence over both HOS_ASPECT and the Aspect ratio, matching the menu's picture. Wider
            than 16:9 the HUD, menus and movies keep the middle 16:9; narrower they fill the picture's width. Until now the one 16:9
            constant in the game's data was changed and the 16:9 picture stretched to the window. */
         const char *e = getenv("HOS_ASPECT");
@@ -1784,8 +1923,9 @@ static int game_main(int argc, char **argv) {
         extern volatile float hos_wide_ratio, hos_wide_squeeze, hos_wide_margin;
         uint32_t hos_output_size(int height);
         const uint32_t output_w = hos_output_size(0), output_h = hos_output_size(1);
-        /* A custom surround output explicitly requests that shape, even if the OS reports one monitor. */
-        if (hos_output_is_surround(output_w, output_h)) want = (float)output_w / (float)output_h;
+        /* An output of a shape of its own (the Insert menu's Aspect ratio: 21:9, 16:10, 4:3, a 32:9 surround...) asks for that
+           shape, over HOS_ASPECT and Ultrawide, even if the OS reports one monitor (host/hos_wide_size.h) */
+        if (hos_output_own_shape(output_w, output_h)) want = (float)output_w / (float)output_h;
         const double game = 16.0 / 9.0;
         /* (a screen narrower than 16:9 too, 16:10 to 5:4: the picture keeps the game's height and is narrower, the
            cameras take its ratio, and the HUD fills its width instead of a middle 16:9 wider than the screen. A 4:3 CRT

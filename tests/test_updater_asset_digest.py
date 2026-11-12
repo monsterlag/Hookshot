@@ -2,8 +2,10 @@
 
 Built for net8.0, the builder's framework, where this .NET SDK has its reference pack (CI installs .NET 8). An SDK of a
 later .NET alone cannot restore net8.0 here (NuGet sources are cleared: NU1100), and the fixture is then built for that
-SDK's own framework, with a line saying so."""
+SDK's own framework, with a line saying so. Not on GitHub's runners: there .NET 8 is installed for the builder, so a
+missing reference pack (or an updater that no longer builds for net8.0) fails the check instead of being built around."""
 import argparse
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -45,6 +47,9 @@ using PortableArchive = DigestFixture.UnusedPortableArchive;
         project.write_text(PROJECT % "net8.0", encoding="utf-8")
         restore = subprocess.run([dotnet, "restore", str(project), "--disable-build-servers"], capture_output=True, text=True)
         if restore.returncode and "NU1100" in restore.stdout + restore.stderr:
+            if os.environ.get("GITHUB_ACTIONS") == "true":   # (as tests/run_all.py tells a runner from a PC)
+                raise SystemExit("on a GitHub runner the updater must build for the builder's net8.0, and its reference "
+                                 "pack is missing: no fallback to a later framework here\n" + restore.stdout + restore.stderr)
             sdk = subprocess.run([dotnet, "--version"], capture_output=True, text=True, check=True).stdout.strip()
             framework = "net%s.0" % sdk.split(".")[0]
             print("this .NET SDK (%s) has no .NET 8 reference pack: the updater is built for %s, not the builder's net8.0"

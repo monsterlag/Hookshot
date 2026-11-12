@@ -5,8 +5,11 @@
    the icons say which button to press on this pad, custom controls too.
 
    The face: hookshot_options.ini's button_prompts (the menu's Button prompts row): 0 Auto, from the first controller's name
-   (SDL), else 1 Switch, 2 Xbox, 3 PlayStation 4, 4 PlayStation 5, 5 Steam Deck. The game reads the font once, at its start;
-   a new face or new controls are written where it keeps it, and its texts drawn again (the live part, below).
+   (SDL; with none, and none through XInput, the keyboard's), else 1 Switch, 2 Xbox, 3 PlayStation 4, 4 PlayStation 5, 5 Steam
+   Deck, 6 Keyboard. The keyboard face (nx2/prompt_keys.py) points each Switch button at the icon of the first key bound to it,
+   the sticks at the keys that move (WASD) and the mouse that turns the camera, and keeps the Switch's textures and the Talk
+   ring's places. The game reads the font once, at its start; a new face or new controls are written where it keeps it, and its
+   texts drawn again (the live part, below).
 
    The font as built: an OpenType font behind an 8-byte header, XORed per little-endian word with the key the header's magic
    (0x18029a7f) gives. Its cmap has, for each face, one icon per pad input at U+F700 + 32 x HOS_PROMPT_* + HOS_PAD_* and the
@@ -31,7 +34,9 @@
 int hos_binding(int set, int button, int slot);   /* nn_hid.c */
 int hos_sdl_pads(uint64_t *buttons, int32_t stick[4]);   /* pad_sdl.c */
 void hos_sdl_pad_first_name(char *out, size_t cap);
-int hos_mods_find(const char *prefix, const char *suffix, char *out, size_t cap);   /* mods.c */
+int hos_mods_file(const char *rel, char *out, size_t cap);   /* mods.c */
+extern const char *hos_romfs_dir;   /* nn_fs.c: the game's RomFS folder */
+int hos_xinput_pads(void);   /* nn_hid.c */
 int rx_option(int id, int otherwise);   /* rx_backend.c: the Insert menu's rows */
 
 #define FONT_PATH "font2/scalable/external.nin_ounce_nvn2.bfotf.zs"   /* (as hos_mods_romfs's keys: lower case) */
@@ -42,7 +47,15 @@ int rx_option(int id, int otherwise);   /* rx_backend.c: the Insert menu's rows 
 #define PAD_BASE 0xF700
 #define FACE_CODES 32   /* (each face's code points: its pad icons, then at STATIC_AT its d-pad icons; nx2/prompt_assets.py) */
 #define STATIC_AT 24
-static const char *const faces[HOS_PROMPT_N] = {"switch", "xbox", "ps4", "ps5", "steamdeck"};
+/* the keyboard face (nx2/prompt_keys.py): each key's icon at KEY_BASE + its key code; a text's code for a Switch button on a key,
+   given out as they come (key_slot); the sticks' icons in a text, the keyboard's and the game's own (stick_code's order) */
+#define KEY_BASE (PAD_BASE + FACE_CODES * HOS_PROMPT_N)
+#define SLOT_BASE 0xEEC0
+#define SLOTS 320
+#define STICK_KEYS 0xF8C0
+#define STICK_GAME 0xF8D0
+#define BINDS (2 * HOS_SW_N)   /* (what the prompts follow: each Switch button's pad input, then its first key: current_binds) */
+static const char *const faces[HOS_PROMPT_N] = {"switch", "xbox", "ps4", "ps5", "steamdeck", "keyboard"};
 /* the Switch buttons' code points in the font, in HOS_SW_* order (nx2/prompt_assets.py SWITCH) */
 static const uint16_t switch_code[HOS_SW_N] = {0xE040, 0xE041, 0xE042, 0xE043, 0xE056, 0xE057, 0xE044, 0xE045,
                                                0xE046, 0xE047, 0xE04B, 0xE04C, 0xE062, 0xE060, 0xE063, 0xE061};
@@ -53,6 +66,10 @@ static const unsigned char switch_pad[HOS_SW_N] = {
     HOS_PAD_RIGHT, HOS_PAD_DOWN};
 /* the d-pad icons that follow the face, not the controls (nx2/prompt_assets.py STATIC) */
 static const uint16_t static_code[3] = {0xE049, 0xE064, 0xE065};
+/* the sticks' icons the keyboard face shows as keys (nx2/prompt_keys.py STICKS): L down, up, left-right, right, left, up-down,
+   any way; R the same; R's four ways */
+static const uint16_t stick_code[15] = {0xE050, 0xE052, 0xE054, 0xE058, 0xE05A, 0xE05C, 0xE05E, 0xE051, 0xE053, 0xE055,
+                                        0xE059, 0xE05B, 0xE05D, 0xE05F, 0xE068};
 
 static int game_dir(char *out, size_t cap) {   /* the game folder, with its separator */
     char path[MAX_PATH];
@@ -85,15 +102,32 @@ static int face_of_name(const char *name) {
     return HOS_PROMPT_XBOX;   /* (Xbox pads, and the many that copy their layout) */
 }
 
-/* the pad input bound to each Switch button now (HOS_SW_N: hos_binding's, as the Controls page sets them) */
+/* the first key bound to Switch button b (a Windows key code, the second slot's when the first is clear), 0 none */
+static int first_key(int b) {
+    int k = hos_binding(HOS_BIND_KEY, b, 0);
+    if (k <= 0 || k > 0xFF) k = hos_binding(HOS_BIND_KEY, b, 1);
+    return k > 0 && k <= 0xFF ? k : 0;
+}
+
+/* the controls now (BINDS: hos_binding's, as the Controls page sets them): the pad input bound to each Switch button, then its
+   first key */
 static void current_binds(int *bind) {
-    for (int b = 0; b < HOS_SW_N; b++) bind[b] = hos_binding(HOS_BIND_PAD, b, 0);
+    for (int b = 0; b < HOS_SW_N; b++) bind[b] = hos_binding(HOS_BIND_PAD, b, 0), bind[HOS_SW_N + b] = first_key(b);
+}
+
+static int keyboard_built;   /* (the build made the keyboard face: prompts/keyboard/; choose_face) */
+
+/* Auto's face: the first controller's (by SDL's name); with none, and none through XInput either, the keyboard's */
+static int auto_face(const char *name) {
+    return !name[0] && keyboard_built && !hos_xinput_pads() ? HOS_PROMPT_KEYBOARD : face_of_name(name);
 }
 
 /* HOS_PROMPT_* (faces[]) */
 static int choose_face(const char *dir) {
     char path[MAX_PATH], line[80];
     int choice = 0;
+    snprintf(path, sizeof path, "%sprompts/keyboard", dir);
+    keyboard_built = GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
     snprintf(path, sizeof path, "%shookshot_options.ini", dir);
     FILE *f = fopen(path, "r");
     if (f) {
@@ -111,7 +145,7 @@ static int choose_face(const char *dir) {
         hos_sdl_pad_first_name(name, sizeof name);
         if (!name[0]) Sleep(50);
     }
-    const int face = face_of_name(name);
+    const int face = auto_face(name);
     hos_log("prompts: auto: controller \"%s\": %s", name[0] ? name : "(none)", faces[face]);
     return face;
 }
@@ -151,21 +185,33 @@ static int cmap4_point(uint8_t *st, unsigned segs, unsigned code, unsigned gid) 
     return 0;
 }
 
-/* the face's icons: each Switch button's segment pointed at the face's icon of its pad input (unbound: of its default's),
-   and the d-pad's at the face's; how many buttons bound */
+/* the face's icons: each Switch button's segment pointed at the face's icon of its pad input (unbound: of its default's; the
+   keyboard face: the icon of its first key, if it has one), the d-pad's at the face's, and the sticks' at the keyboard's or the
+   game's own; how many buttons bound */
 static int cmap4_bind(uint8_t *st, size_t n, int face) {
     const unsigned segs = rd16(st + 6) / 2;
     if (14 + 8 * (size_t)segs + 2 > n) return 0;   /* (as cmap4_glyph: the ranges' last entry too) */
     const unsigned base = PAD_BASE + FACE_CODES * (unsigned)face;
+    const int keys = face == HOS_PROMPT_KEYBOARD;
     int done = 0;
     for (int b = 0; b < HOS_SW_N; b++) {
+        const int k = keys ? first_key(b) : 0;
+        const unsigned kid = k ? cmap4_glyph(st, n, KEY_BASE + (unsigned)k) : 0;
+        if (kid && cmap4_point(st, segs, switch_code[b], kid)) {
+            done++;
+            continue;
+        }
         const int pad = hos_binding(HOS_BIND_PAD, b, 0), bound = pad >= 0 && pad < HOS_PAD_ART_N;   /* (a paddle: the default's icon) */
         const unsigned gid = cmap4_glyph(st, n, base + (unsigned)(bound ? pad : switch_pad[b]));
-        if (gid && cmap4_point(st, segs, switch_code[b], gid)) done += bound;
+        if (gid && cmap4_point(st, segs, switch_code[b], gid)) done += bound && !keys;
     }
     for (int k = 0; k < 3; k++) {
         const unsigned gid = cmap4_glyph(st, n, base + STATIC_AT + (unsigned)k);
         if (gid) cmap4_point(st, segs, static_code[k], gid);
+    }
+    for (int i = 0; i < 15; i++) {   /* (a font built without the keyboard face has none of these: nothing changes) */
+        const unsigned gid = cmap4_glyph(st, n, (keys ? STICK_KEYS : STICK_GAME) + (unsigned)i);
+        if (gid) cmap4_point(st, segs, stick_code[i], gid);
     }
     return done;
 }
@@ -482,6 +528,15 @@ static Run *texture_runs(const uint8_t *t, long tn, const int *bind, size_t *nru
     return runs;
 }
 
+/* the face whose textures a face shows (the keyboard's: the Switch's), and the controls they follow (the keyboard face: the
+   Switch's own, its default controls: the game's pictures as they are); own: room for those */
+static int texture_face(int face) { return face == HOS_PROMPT_KEYBOARD ? HOS_PROMPT_SWITCH : face; }
+static const int *texture_bind(int face, const int *bind, int *own) {
+    if (face != HOS_PROMPT_KEYBOARD) return bind;
+    for (int b = 0; b < HOS_SW_N; b++) own[b] = switch_pad[b];
+    return own;
+}
+
 static void live_textures_start(const char *bntx, const Run *runs, size_t nruns);
 static void part_served(int p, int face, const int *bind);
 enum { PART_TEXTURES, PART_LAYOUTS, PART_FONT, PARTS };
@@ -490,15 +545,15 @@ static int build_textures(char *out, size_t cap) {
     char dir[MAX_PATH], path[MAX_PATH];
     int face;
     if (!setup(dir, sizeof dir, &face)) return 0;
-    snprintf(path, sizeof path, "%sprompts/%s/textures.bin", dir, faces[face]);
+    snprintf(path, sizeof path, "%sprompts/%s/textures.bin", dir, faces[texture_face(face)]);
     long tn;
     uint8_t *t = read_all(path, "HPTX", &tn);
     if (!t) return 0;   /* (built without the textures: the game's) */
-    int bind[HOS_SW_N];
+    int bind[BINDS], own[HOS_SW_N];
     current_binds(bind);
     uint64_t h = fnv(fnv(fnv(0xcbf29ce484222325ull, &face, sizeof face), bind, sizeof bind), t, (size_t)tn);
     size_t nruns;
-    Run *runs = texture_runs(t, tn, bind, &nruns);
+    Run *runs = texture_runs(t, tn, texture_bind(face, bind, own), &nruns);
     snprintf(path, sizeof path, "%sprompts/Common.bntx", dir);
     live_textures_start(path, runs, nruns);   /* (before write_patched sorts them: the ranges only) */
     snprintf(out, cap, "%sprompts/Common.bntx.zs", dir);
@@ -623,9 +678,9 @@ static struct {
 
 /* what the game is to show now (the start's, then each change's): the face and the controls; and what each part it loaded
    shows (PART_*: the start's until written over, so a part found after a change catches up) */
-static int live_face_now = -1, live_bind_now[HOS_SW_N];
-static int part_face[PARTS], part_bind[PARTS][HOS_SW_N];
-static int served_face[PARTS], served_bind[PARTS][HOS_SW_N];   /* (each part's file as served: what the game loads again) */
+static int live_face_now = -1, live_bind_now[BINDS];
+static int part_face[PARTS], part_bind[PARTS][BINDS];
+static int served_face[PARTS], served_bind[PARTS][BINDS];   /* (each part's file as served: what the game loads again) */
 static void live_start(int face, const int *bind) {   /* (the first file served: the start's) */
     if (live_face_now >= 0) return;
     memcpy(live_bind_now, bind, sizeof live_bind_now);
@@ -723,6 +778,7 @@ void hos_prompts_pool_gone(uint64_t mem) {
 /* the pool's textures as this face and these controls choose them; 0 when they could not be */
 /* the face's textures.bin, read once (before tex_lock: a finalize waits for the writes alone); 0 none */
 static int texture_bin(const char *dir, int face) {
+    face = texture_face(face);
     if (!tex.bins[face]) {
         char path[MAX_PATH];
         snprintf(path, sizeof path, "%sprompts/%s/textures.bin", dir, faces[face]);
@@ -735,7 +791,8 @@ static int live_textures(const char *dir, int face, const int *bind) {
     if (!texture_bin(dir, face)) return 0;
     size_t nruns, written, put_back;
     if (!__atomic_load_n(&tex.l.base, __ATOMIC_ACQUIRE)) return 0;   /* (finalized since: hos_prompts_pool_gone; tex_lock held) */
-    Run *runs = texture_runs(tex.bins[face], tex.nbins[face], bind, &nruns);
+    int own[HOS_SW_N];
+    Run *runs = texture_runs(tex.bins[texture_face(face)], tex.nbins[texture_face(face)], texture_bind(face, bind, own), &nruns);
     const size_t outside = put_runs(&tex.l, runs, nruns, &written, &put_back);
     free(runs);
     hos_log("prompts: now %s textures: %zu runs written, %zu put back%s", faces[face], written, put_back,
@@ -873,10 +930,71 @@ static uint8_t *font_bound(const char *dir, int face, long *n, uint32_t *key, in
 #define BIND_BASE 0xF000
 static volatile LONG font_changes;
 
+/* each format 4 subtable of the decrypted font (otf, n bytes): code's own segment pointed at the glyph of code to; 0 when it has
+   no glyph there (or code no segment of its own) */
+static int font_point(uint8_t *otf, size_t n, unsigned code, unsigned to) {
+    if (n < 12) return 0;
+    const unsigned tables = rd16(otf + 4);
+    int done = 0;
+    for (unsigned t = 0; t < tables && 12 + 16 * (size_t)(t + 1) <= n; t++) {
+        const uint8_t *rec = otf + 12 + 16 * t;
+        if (memcmp(rec, "cmap", 4)) continue;
+        const uint32_t off = rd32(rec + 8), len = rd32(rec + 12);
+        if (off > n || len > n - off || len < 4) return 0;
+        uint8_t *cmap = otf + off;
+        for (unsigned s = 0; s < rd16(cmap + 2) && 4 + 8 * (size_t)(s + 1) <= len; s++) {
+            const uint32_t so = rd32(cmap + 4 + 8 * s + 4);
+            if (so > len || len - so < 14 || rd16(cmap + so) != 4) continue;
+            const unsigned sl = rd16(cmap + so + 2), sn = sl <= len - so ? sl : len - so, segs = rd16(cmap + so + 6) / 2;
+            const unsigned gid = 14 + 8 * (size_t)segs + 2 <= sn ? cmap4_glyph(cmap + so, sn, to) : 0;
+            if (gid) done |= cmap4_point(cmap + so, segs, code, gid);   /* (platforms 0 and 3 share one: the same written twice) */
+        }
+        return done;
+    }
+    return 0;
+}
+
+/* the keyboard face's codes in texts: one for each Switch button and key shown, given out as they come (from SLOT_BASE: a code
+   whose glyph the game has never drawn) and pointed at the key's icon where the game keeps the font; the font served again
+   (live_font) keeps them (slots_point) */
+static SRWLOCK slot_lock = SRWLOCK_INIT;
+static uint8_t slot_button[SLOTS], slot_key[SLOTS];
+static volatile int nslots;
+
+static void slots_point(uint8_t *otf, size_t n) {   /* (slot_lock held) */
+    for (int s = 0; s < nslots; s++) font_point(otf, n, SLOT_BASE + (unsigned)s, KEY_BASE + slot_key[s]);
+}
+
+/* the code of Switch button b on key k in a text; -1 when the key has no icon, the font is not found, or all are given out */
+static int key_slot(int b, int k) {
+    AcquireSRWLockExclusive(&slot_lock);
+    int s = 0;
+    while (s < nslots && !(slot_button[s] == b && slot_key[s] == k)) s++;
+    if (s == nslots) {
+        uint8_t *q = s < SLOTS && font.at ? (uint8_t *)hos_guest_range(font.at, font.n - 8) : NULL;
+        if (q && font_point(q, font.n - 8, SLOT_BASE + (unsigned)s, KEY_BASE + (unsigned)k)) {
+            slot_button[s] = (uint8_t)b, slot_key[s] = (uint8_t)k;
+            nslots = s + 1;
+        } else {
+            static int full_said;   /* (said once: every text after asks again) */
+            if (s == SLOTS && !full_said++)
+                hos_log("prompts: the %d codes for buttons on keys are all given out: a key bound from now on shows the Switch's "
+                        "icon in texts until the next start", SLOTS);
+            s = -1;
+        }
+    }
+    ReleaseSRWLockExclusive(&slot_lock);
+    return s < 0 ? -1 : SLOT_BASE + s;
+}
+
 static int text_code(unsigned c, int face, const int *bind) {   /* the code that shows c's button now, else -1 */
     int b = -1, k = -1;
+    for (int i = 0; i < 15 && keyboard_built; i++)   /* (a stick's: the keyboard's keys, or the game's own icon) */
+        if (c == stick_code[i] || c == STICK_KEYS + (unsigned)i || c == STICK_GAME + (unsigned)i)
+            return (face == HOS_PROMPT_KEYBOARD ? STICK_KEYS : STICK_GAME) + i;
     for (int i = 0; i < HOS_SW_N && b < 0; i++)
         if (c == switch_code[i]) b = i;
+    if (c >= SLOT_BASE && c < SLOT_BASE + SLOTS && (int)(c - SLOT_BASE) < nslots) b = slot_button[c - SLOT_BASE];
     for (int i = 0; i < 3 && k < 0; i++)
         if (c == static_code[i]) k = i;
     if (c >= BIND_BASE && c < BIND_BASE + HOS_PROMPT_N * HOS_SW_N * HOS_PAD_ART_N) b = (int)((c - BIND_BASE) / HOS_PAD_ART_N % HOS_SW_N);
@@ -885,6 +1003,10 @@ static int text_code(unsigned c, int face, const int *bind) {   /* the code that
         k = (int)((c - PAD_BASE) % FACE_CODES - STATIC_AT);
     if (k >= 0) return PAD_BASE + FACE_CODES * face + STATIC_AT + k;
     if (b < 0) return -1;
+    if (face == HOS_PROMPT_KEYBOARD && bind[HOS_SW_N + b]) {   /* (its key's code; none: the Switch's icon, as unbound) */
+        const int s = key_slot(b, bind[HOS_SW_N + b]);
+        if (s >= 0) return s;
+    }
     const int pad = bind[b] >= 0 && bind[b] < HOS_PAD_ART_N ? bind[b] : switch_pad[b];   /* (a paddle: the default's icon) */
     return BIND_BASE + (face * HOS_SW_N + b) * HOS_PAD_ART_N + pad;
 }
@@ -894,7 +1016,7 @@ static int text_rewrite(uint64_t box) {
     if (!font_changes) return 0;
     const int face = live_face_now;
     if (face < 0 || face >= HOS_PROMPT_N) return 0;
-    int bind[HOS_SW_N];
+    int bind[BINDS];
     memcpy(bind, live_bind_now, sizeof bind);
     const uint64_t *text = (const uint64_t *)hos_guest_range(box + 0xf0, 8);
     const uint32_t *len = (const uint32_t *)hos_guest_range(box + 0x124, 4);
@@ -949,12 +1071,19 @@ void hos_prompts_glyph(uint64_t slot) {
         last = face;   /* (another font: not looked at again while its glyphs follow each other) */
         return;
     }
-    const uint64_t at = base[0] + (base[1] == font.n ? 8 : 0);   /* (kept with its 8-byte header, or without) */
-    const uint8_t *q = (const uint8_t *)hos_guest_range(at, font.n - 8);
-    if (!q) return;
-    if (memcmp(q, font.head, sizeof font.head)) {
-        last = face;   /* (another font of that size) */
-        return;
+    /* (a stream of the file's size may hold the font behind its 8-byte header, or from its start, as on native Windows: the
+       font's own head says which) */
+    uint64_t at = 0;
+    int unread = 0;
+    for (uint64_t a = base[0] + (base[1] == font.n ? 8 : 0);; a = base[0]) {
+        const uint8_t *q = (const uint8_t *)hos_guest_range(a, font.n - 8);
+        if (!q) unread = 1;
+        else if (!memcmp(q, font.head, sizeof font.head)) { at = a; break; }
+        if (a == base[0]) break;
+    }
+    if (!at) {
+        if (!unread) last = face;   /* (another font of that size) */
+        return;   /* (else not readable yet: looked at again) */
     }
     font.at = at;
     hos_log("prompts: the font at %#llx: the icons in texts follow at once", (unsigned long long)font.at);
@@ -968,7 +1097,10 @@ static int live_font(const char *dir, int face) {
     uint8_t *q = b && (uint32_t)n == font.n ? (uint8_t *)hos_guest_range(font.at, (uint64_t)n - 8) : NULL;
     const int ok = q && !memcmp(q, b + 8, 64);   /* (still the font: its tables' directory, which a binding leaves as is) */
     if (ok) {
+        AcquireSRWLockExclusive(&slot_lock);   /* (the keys' codes given out stay on their keys) */
+        slots_point(b + 8, (size_t)n - 8);
         memcpy(q, b + 8, (size_t)n - 8);
+        ReleaseSRWLockExclusive(&slot_lock);
         InterlockedIncrement(&font_changes);
         hos_log("prompts: now the %s icons in texts, %d buttons on these controls", faces[face], bound);
     } else if (q) {
@@ -987,7 +1119,7 @@ static int live_face(void) {
     if (choice < 0) return live_face_now;   /* (no menu: the start's) */
     char name[128] = "";
     hos_sdl_pad_first_name(name, sizeof name);
-    return face_of_name(name);
+    return auto_face(name);
 }
 
 /* nn_hid.c, as the game reads its controller (every frame; looked at every 100 ms): the face or the controls changed, or a
@@ -1002,7 +1134,7 @@ void hos_prompts_live(void) {
     if (now - last >= 100000000) {
         last = now;
         find_layouts();
-        int bind[HOS_SW_N];
+        int bind[BINDS];
         current_binds(bind);
         const int face = live_face();
         if ((hos_prompts_live_parts() & HOS_PROMPTS_LIVE_ALL) != HOS_PROMPTS_LIVE_ALL) {   /* (the menu asks for a restart then:
@@ -1090,7 +1222,7 @@ static int build_layouts(char *out, size_t cap) {
     char dir[MAX_PATH], path[MAX_PATH];
     int face;
     if (!setup(dir, sizeof dir, &face)) return 0;
-    int bind[HOS_SW_N];
+    int bind[BINDS];
     current_binds(bind);
     Layout o;
     if (!layout_runs(dir, face, bind, &o)) return 0;
@@ -1124,7 +1256,9 @@ static int layout_runs(const char *dir, int face, const int *bind, Layout *o) {
     memset(o, 0, sizeof *o);
     snprintf(path, sizeof path, "%sprompts/Common.blarc", dir);
     if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) return 0;
-    ring_places(bind, o->place);
+    int pads[HOS_SW_N];   /* (the keyboard face: no pad input, the Switch's places) */
+    for (int b = 0; b < HOS_SW_N; b++) pads[b] = face == HOS_PROMPT_KEYBOARD ? -1 : bind[b];
+    ring_places(pads, o->place);
     const int ring_moved = !(o->place[0] == 0 && o->place[1] == 1 && o->place[2] == 2 && o->place[3] == 3);
     size_t cap_runs = 64;
     o->runs = (Run *)malloc(cap_runs * sizeof *o->runs);
@@ -1158,7 +1292,7 @@ static int layout_runs(const char *dir, int face, const int *bind, Layout *o) {
         const size_t panes_at = 8 + 4 * (size_t)npads;
         float extra[5], shift[6] = {0};
         for (int i = 0; i < 5; i++) {
-            const int p = bind[notes[i]];
+            const int p = face == HOS_PROMPT_KEYBOARD ? bind[HOS_SW_N + notes[i]] : bind[notes[i]];   /* (keyboard: by key) */
             extra[i] = 0;
             if (p >= 0 && (uint32_t)p < npads && panes_at <= (size_t)hn) memcpy(&extra[i], hint + 8 + 4 * p, 4);
         }
@@ -1182,15 +1316,34 @@ static int layout_runs(const char *dir, int face, const int *bind, Layout *o) {
     return 1;
 }
 
+/* The game's table name, as nx2/prompt_assets.py selects it for the prompts. A mod can
+   include other versions' tables too; those must not seed the one-time merge. */
+static int game_table(char *out, size_t cap) {
+    char pattern[MAX_PATH], name[MAX_PATH] = "";
+    if (!hos_romfs_dir) return 0;
+    snprintf(pattern, sizeof pattern, "%s/System/Resource/ResourceSizeTable.*.rsizetable.zs", hos_romfs_dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE f = FindFirstFileA(pattern, &fd);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && (!name[0] || strcmp(fd.cFileName, name) < 0))
+            snprintf(name, sizeof name, "%s", fd.cFileName);
+    } while (FindNextFileA(f, &fd));
+    FindClose(f);
+    if (!name[0]) return 0;
+    snprintf(out, cap, "System/Resource/%s", name);
+    return 1;
+}
+
 /* builds prompts/External.bfotf.zs for this run; 1 when there is one */
 static int build(char *out, size_t cap) {
     char dir[MAX_PATH], path[MAX_PATH];
     int face;
     if (!setup(dir, sizeof dir, &face)) return 0;
-    /* (a mod's size table is served with ours merged in: sizes. One that cannot take ours is served as it is, and the font,
-       larger than the game's, would not fit it) */
-    char mod[MAX_PATH];
-    if (hos_mods_find(SIZES_PATH, ".rsizetable.zs", mod, sizeof mod) && sizes(dir, mod, path, sizeof path) < 0) {
+    /* A mod's size table is served with ours merged in. Check the same table even when the font
+       is opened first; an unmergeable one cannot hold the font, which is larger than the game's. */
+    char table[MAX_PATH], mod[MAX_PATH];
+    if (game_table(table, sizeof table) && hos_mods_file(table, mod, sizeof mod) && sizes(dir, mod, path, sizeof path) < 0) {
         hos_log("prompts: a mod's resource size table cannot take the prompts' sizes: the game's own icons in texts");
         return 0;
     }
@@ -1204,13 +1357,14 @@ static int build(char *out, size_t cap) {
     snprintf(out, cap, "%sprompts/External.bfotf.zs", dir);
     const int ok = write_zstd_raw(out, b, (size_t)n);
     if (ok) {
-        int bind[HOS_SW_N];
+        int bind[BINDS];
         current_binds(bind);
         part_served(PART_FONT, face, bind);
         font.n = n >= 8 + 64 ? (uint32_t)n : 0;
     }
     free(b);
-    hos_log("prompts: %s icons, %d buttons on this pad's controls%s", faces[face], bound, ok ? "" : ": could not be written");
+    hos_log("prompts: %s icons, %d buttons on these %s%s", faces[face], bound, face == HOS_PROMPT_KEYBOARD ? "keys" : "pad's controls",
+            ok ? "" : ": could not be written");
     return ok;
 }
 

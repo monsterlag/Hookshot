@@ -283,6 +283,28 @@ It changes the game as the menu's teleport does, and a save made after it keeps 
 < {"id":13,"ok":true,"frame":6190,"state":"loading","waited":187,"map":"HyruleField_Child"}
 ```
 
+**age** (OoT): the Debug tab's Switch age, so a script can reach the adult's maps (or the child's) without a save of
+that age: `to`, `"child"` or `"adult"`, none the other age. The game takes it as it takes a teleport, at the player's
+next update in play, and does it as the menu does: Link's age flipped and the current map reloaded in the other age
+(the Market's, when this map has no destination). It uses the teleport's tickets, so a later teleport or age switch
+replaces one not taken yet (`cancelled`), and the replies are the teleport's:
+
+- `"age"` (the age asked for), `"sent": true` and `map`, the map it reloads; `wait loading_end` then tells when it
+  arrived. Not `wait map`: in a dungeon the map has the same name for both ages (`ForestTemple`), so a wait for it is met
+  before the reload starts. `accepted` as for a teleport.
+- `"sent": false` when Link is that age already: nothing is done. The game checks the age asked for when it takes it, so
+  an old sample of Link's age in `status` (it is read every 250 ms, and not during a load) never flips him the wrong way.
+  With no `to`, the other age is decided from that sample.
+- `refused`, with the game's reason (as a teleport's, and Link's age not found or not written in the game's data);
+  `timeout` when the game did not take it (not in play); `unavailable` before a save is loaded (the age is not known).
+
+With `"wait": false` the reply is at once, with `"sent": null`. The game logs it (`cheats: age toggle: ...`).
+
+```
+> {"id":14,"cmd":"age","to":"adult"}
+< {"id":14,"ok":true,"frame":7310,"age":"adult","sent":true,"map":"KokiriForest_Adult","accepted":true}
+```
+
 **quit**: the reply, then the game exits as when its window is closed (the log flushed, exit code 0). The socket is
 removed.
 
@@ -393,6 +415,7 @@ python -I scripts/hookshot_ctl.py option get
 python -I scripts/hookshot_ctl.py option set text_speed 3
 python -I scripts/hookshot_ctl.py teleport                              # the destinations
 python -I scripts/hookshot_ctl.py teleport 1 --arrive 30                # sent (or refused, and why), then arrived
+python -I scripts/hookshot_ctl.py age adult --arrive 30                 # the Debug tab's Switch age, then reloaded
 python -I scripts/hookshot_ctl.py release                               # this client's inputs and abandoned ones (--all)
 python -I scripts/hookshot_ctl.py watch --events present,state --log "hid:"
 python -I scripts/hookshot_ctl.py raw '{"cmd": "wait", "event": "frame", "frame": 9000}'

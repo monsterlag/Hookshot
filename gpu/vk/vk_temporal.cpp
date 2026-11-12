@@ -146,6 +146,9 @@ struct State {
     std::mutex mu;
     Engine engines[3];               // (DLSS, FSR 4, FSR 3.1: engine_of)
     const TemporalEngine* drawing = nullptr;   // (the engine that drew last: another one starts a new history)
+    int drawn_mode = ur::GAME;
+    bool dlaa_waiting = false;
+    uint64_t dlaa_wait_frame = 0;
     Image color, depth, motion, output;
     VkDescriptorSetLayout prep_set = VK_NULL_HANDLE, out_set = VK_NULL_HANDLE;
     VkPipelineLayout prep_layout = VK_NULL_HANDLE, out_layout = VK_NULL_HANDLE;
@@ -620,8 +623,9 @@ uint32_t bones_used(const SkinnedDraw& k) {
     for (int64_t i = 0; i < n; i++) {
         const uint8_t* q = v.data() + (size_t)i * k.stride;
         for (int set = 0; set < k.sets; set++)
-            for (int j = 0; j < 4; j++) {
-                if (!q[k.weights[set] + j]) continue;
+            for (int j = 0; j < ((k.formats & (dlss_actor::kSingle << set)) ? 1 : (k.formats & (dlss_actor::kPair << set)) ? 2 : 4);
+                 j++) {   // (one in a single set, two in a pair; a set without weights weighs 1)
+                if (!(k.formats & (dlss_actor::kNoWeight << set)) && !q[k.weights[set] + j]) continue;
                 uint32_t joint = 0;
                 if (k.formats & (dlss_actor::kByteJoints << set)) joint = q[k.joints[set] + j];
                 else std::memcpy(&joint, q + k.joints[set] + 2 * j, 2);
@@ -748,6 +752,18 @@ int temporal_status(char* b, size_t n) {
              (unsigned long long)(own >> 20), feature);
     s.status_draws = s.actor_draws, s.status_frames = s.actor_frames, s.actor_ns = 0, s.status_drawn = s.status_passed = 0;
     return mode;
+}
+
+void temporal_reset_failure() {
+    State& s = st();
+    std::lock_guard lk(s.mu);
+    for (auto& k : s.engines) {
+        k.failed.store(false, std::memory_order_relaxed);
+    }
+    s.reason = nullptr;
+    s.reason_repeats = 0;
+    s.last_frame = 0;
+    dlss_retry();   // (and a DLSS feature that was not made, which is held off there, not by `failed`)
 }
 
 void temporal_idle() {
@@ -913,6 +929,19 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
     }
     const VkImageView dview = depth_view(cam.depth);
     if (!dview) return fail("no view of the scene depth");
+    // Give queued small scenes three frames to reach the requested native size.
+    // Some games keep a smaller scene even at full scale: then use native AA at that size.
+    // Creating DLAA for that queued scene would replace the feature twice in successive frames.
+    const bool entering_dlaa = mode == ur::DLAA && s.drawing == engine.e && s.drawn_mode == ur::DLSS;
+    const bool queued_native = entering_dlaa && (rw != ow || rh != oh);
+    const uint64_t frame = texture_frame_no();
+    if (queued_native && !s.dlaa_waiting) s.dlaa_waiting = true, s.dlaa_wait_frame = frame;
+    const bool wait_expired = queued_native && (frame < s.dlaa_wait_frame || frame - s.dlaa_wait_frame >= 3);
+    if (wait_expired)
+        logf("vk: DLAA native scene still %ux%u after three frames; using it for output %ux%u", rw, rh, ow, oh);
+    const bool waiting_for_native = queued_native && !wait_expired;
+    if (!waiting_for_native) s.dlaa_waiting = false;
+    const int draw_mode = waiting_for_native ? ur::DLSS : mode;
     if (s.drawing != engine.e) {   // (another engine than the one before: that one's state let go, and a new history)
         if (s.drawing) {
             logf("vk: upscaler: %s in place of %s (frame %llu)", engine.e->name, s.drawing->name,
@@ -924,7 +953,7 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
     }
     // (DLAA, FSR's native AA: the engine at the render size, anti-aliasing alone; its picture then scaled to the output's by
     // dlss_out.comp. With them the 3D is drawn at full scale, temporal_full_scale)
-    const bool native = ur::full_scale(mode);
+    const bool native = ur::full_scale(draw_mode);
     const uint32_t dw = native ? rw : ow, dh = native ? rh : oh;
     // (from here commands are recorded, the engine's own too: whichever way this returns, the program's descriptor pushes are
     // gone from the bind point and are pushed again)
@@ -933,7 +962,7 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
     } disturbed;
     uint32_t iw = rw, ih = rh;
     const char* why = nullptr;
-    const int ready = engine.e->prepare(cmd, rw, rh, dw, dh, &iw, &ih, &why);
+    const int ready = engine.e->prepare(cmd, rw, rh, dw, dh, native, &iw, &ih, &why);
     if (ready < 0) {
         engine.failed = true;
         return fail(why ? why : "it could not be made");
@@ -1058,6 +1087,7 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
     // frames. Nothing unless the run asked for it)
     dlss_fg_inputs(cmd, f, cam.projection, cam.current, cam.jitter, motion);
     s.last_frame = now;
+    s.drawn_mode = draw_mode;
     s.last_jitter[0] = cam.jitter[0], s.last_jitter[1] = cam.jitter[1];
     // (for the status line, temporal_status: the jitter the engine was given, in render pixels)
     s.status_jitter[0] = f.jitter[0], s.status_jitter[1] = f.jitter[1], s.status_motion = motion;

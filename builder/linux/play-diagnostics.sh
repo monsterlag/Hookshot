@@ -19,6 +19,9 @@ reader=$!
 exec 3<&-
 "$1" >/dev/null
 printf '\nHookshot exited with status %s\n' "$?" > "$temporary/status"
+if [ "$#" -gt 1 ]; then
+    printf '%s\n' "$2" >> "$temporary/status"
+fi
 exec 2>/dev/null
 wait "$reader"
 if [ -f "$temporary/stderr" ] && [ -f "$temporary/status" ]; then
